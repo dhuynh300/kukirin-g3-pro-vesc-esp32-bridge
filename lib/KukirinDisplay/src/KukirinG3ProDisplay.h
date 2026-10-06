@@ -1,12 +1,3 @@
-//! KNOWN PITFALLS & FAILURE MODES:
-//! - P14 [5V Display TX Level]: Display TX line is 5V TTL. ESP32 GPIOs are NOT 5V tolerant. Mandatory voltage divider (R1=1.0k, R2=1.8k) with 2.2nF..4.7nF parallel cap.
-//! - P15 [Pure Bitwise XOR Checksum]: TFM13-FEIMI-1 protocol uses pure 12-byte bitwise XOR checksum across Bytes 0..11. E-006 receiver error is asserted by corrupting/inverting this checksum during test injection.
-//! - P16 [Display Framing & Cadence]: Display transmits single 20-byte frames (0x01 0x14) at continuous 8.0 Hz (125.2ms period, zero bursts, zero packet duplication). Buffer recovery requires sliding-window memmove.
-//! - P17 [Fixed-Point Speed Rendering]: LCD latches directly into 7-segment display without firmware averaging. Requires discrete 2-stage fixed-point digital twin.
-//! - P18 [P-Menu Staging]: Live P-menu modifications while riding can cause sudden torque spikes; settings must quarantine until stationary (<= 3.0 mph) and neutral.
-//! - P21 [Synchronous Response Mandate]: Controller response must transmit synchronously within the frame transaction window to satisfy display timeout (<2.5s).
-//! - P22 [Brake Release Quorum]: Asymmetric debounce (1-frame instant trip, debounced release) guarantees zero lag on emergency braking.
-
 #pragma once
 
 #include <Arduino.h>
@@ -17,51 +8,49 @@
 
 /**
  * @struct KukirinInputs
- * @brief High-level snapshot of all physical handlebar controls, switches, and P-menu settings.
+ * @brief Filtered rider inputs from one display frame.
  */
 struct KukirinInputs {
-    uint16_t rawThrottle = 0;              /**< @brief Raw ADC throttle counts (0..1000). */
-    float    normalizedThrottle = 0.0f;   /**< @brief Normalized throttle [0.0f..1.0f] with deadband and ceiling. */
-    bool     brakeActive = false;          /**< @brief True if mechanical or electronic brake lever is engaged. */
-    bool     lightsActive = false;         /**< @brief True if headlight/taillight switch is ON. */
-    bool     leftTurn = false;             /**< @brief True if left turn signal rocker switch is ON. */
-    bool     rightTurn = false;            /**< @brief True if right turn signal rocker switch is ON. */
-    bool     hazardLightsActive = false;   /**< @brief True if double-tap 4-way hazard lights mode is active. */
-    bool     hornActive = false;           /**< @brief True if horn pushbutton is currently pressed. */
-    uint8_t  gear = 1;                     /**< @brief Drive gear: 1 (Eco), 2 (Std), 3 (Turbo). */
+    uint16_t rawThrottle = 0;              /**< @brief Throttle after the idle and full-throttle switches, 0..1000. */
+    float    normalizedThrottle = 0.0f;   /**< @brief Throttle 0..1. */
+    bool     brakeActive = false;          /**< @brief Brake lever pulled. */
+    bool     lightsActive = false;         /**< @brief Lights on. */
+    bool     leftTurn = false;             /**< @brief Left turn signal on. */
+    bool     rightTurn = false;            /**< @brief Right turn signal on. */
+    bool     hazardLightsActive = false;   /**< @brief Hazards on (turn switch pushed twice). */
+    bool     hornActive = false;           /**< @brief Horn button pressed. */
+    uint8_t  gear = 1;                     /**< @brief Mode 1..3. */
     KukirinG3Pro::DriveMode driveMode = KukirinG3Pro::DriveMode::Eco;
-    KukirinG3Pro::DecodedSettings settings;/**< @brief Parsed P-menu configuration parameters (P01..PB). */
-    bool     pmenuUpdated = false;         /**< @brief True if P-menu settings were committed/updated this frame. */
-    float    frameDt = 0.1f;               /**< @brief Inter-frame arrival delta time in seconds. */
-    uint32_t packetCount = 0;              /**< @brief Cumulative frame counter. */
+    KukirinG3Pro::DecodedSettings settings;/**< @brief P-menu settings in effect. */
+    bool     pmenuUpdated = false;         /**< @brief The settings in effect changed with this frame. */
+    float    frameDt = 0.1f;               /**< @brief Time since the previous valid frame, s. */
+    uint32_t packetCount = 0;              /**< @brief Valid frames received so far. */
 };
 
 /**
  * @struct KukirinResponse
- * @brief Telemetry payload returned synchronously to the TFM13-FEIMI-1 dashboard.
+ * @brief What the next status frame shows on the display.
  */
 struct KukirinResponse {
-    float speedMph = 0.0f;                    /**< @brief Vehicle forward speed in miles per hour. */
-    bool  dualMode = true;                    /**< @brief True to display Dual-Motor icon on screen. */
-    KukirinG3Pro::ErrorCode errorCode = KukirinG3Pro::ErrorCode::None; /**< @brief Diagnostic fault code. */
-    bool  tripMode = false;                   /**< @brief True = Trip Odometer, False = Lifetime Odometer (ODO). */
+    float speedMph = 0.0f;                    /**< @brief Speed to show, mph. */
+    bool  dualMode = true;                    /**< @brief Show dual drive. */
+    KukirinG3Pro::ErrorCode errorCode = KukirinG3Pro::ErrorCode::None; /**< @brief Error code to show. */
+    bool  tripMode = false;                   /**< @brief Trip odometer instead of total. */
 };
 
 /**
  * @class KukirinG3ProDisplay
- * @brief Production C++ driver library for the Kukirin G3 Pro TFM13-FEIMI-1 display protocol.
- * @details Features:
- *          - Dual Operation: Pattern B (Atomic Transaction Callback) & Pattern A/C (State Polling & Setters)
- *          - Thread-Safe / Cross-Core Safe (Core 1 real-time UART execution, Core 0 async setters/getters)
- *          - Zero dynamic memory allocation in main loop paths
- *          - Lock-free std::atomic fast-path getters for real-time motor control loops
- *          - Bounded FreeRTOS mutexes (pdMS_TO_TICKS(5)) to eliminate priority inversion and core stalls
- *          - Optional integrated accessory GPIO engine (Left/Right turn blinkers, DRLs, brake strobe, horn watchdog)
- *          - Frame-synchronous 0ms response latency
+ * @brief Plays the controller's role towards the G3 Pro display.
+ *
+ * update() reads command frames and answers each valid one immediately with a status frame; the display shows
+ * E-006 if replies stop for about 2.5 s. Inputs can be used in two ways: a transaction callback called once per
+ * frame (it can set the reply), or getters and setters. Getters read std::atomic copies, so they are safe to
+ * call from the other core; the full structs are guarded by a mutex with a 2-5 ms wait limit.
+ * Optional: lights, turn signals, brake light and horn outputs (initGPIO()). No heap allocation after construction.
  */
 class KukirinG3ProDisplay {
 public:
-    // Canonical Hardware Pin Aliases (backed by KukirinG3Pro::Pins)
+    // Default pins (KukirinG3Pro::Pins)
     static constexpr int8_t PIN_LEFT_LED      = KukirinG3Pro::Pins::LeftLed;
     static constexpr int8_t PIN_RIGHT_LED     = KukirinG3Pro::Pins::RightLed;
     static constexpr int8_t PIN_BRAKE_LED     = KukirinG3Pro::Pins::BrakeLed;
@@ -74,7 +63,7 @@ public:
     static constexpr int8_t PIN_ARGB_4        = KukirinG3Pro::Pins::Argb4;
     static constexpr int8_t PIN_BUTTON_DS     = KukirinG3Pro::Pins::ButtonDs;
 
-    // Function Signatures (Zero Dynamic Allocation)
+    // Callback types (plain function pointers)
     typedef void (*TransactionCallback)(const KukirinInputs& in, KukirinResponse& out);
     typedef void (*ThrottleCallback)(uint16_t raw, float normalized);
     typedef void (*BrakeCallback)(bool active);
@@ -91,11 +80,10 @@ public:
     using RXPacket = KukirinG3Pro::RXPacket;
 
     /**
-     * @brief Constructs a new display driver instance.
-     * @param[in] displaySerial Pointer to HardwareSerial connected to display (e.g. &Serial2).
-     * @param[in] rxPin ESP32 GPIO pin for UART RX (Display TX via voltage divider).
-     * @param[in] txPin ESP32 GPIO pin for UART TX (Display RX).
-     * @param[in] buttonDsPin ESP32 GPIO pin for handlebar D/S switch (default GPIO 39, -1 to disable).
+     * @param[in] displaySerial UART connected to the display, e.g. &Serial2.
+     * @param[in] rxPin RX GPIO; the display's 5 V TX line must go through a divider.
+     * @param[in] txPin TX GPIO.
+     * @param[in] buttonDsPin Dual/single button input, -1 if none.
      */
     KukirinG3ProDisplay(HardwareSerial* displaySerial,
                         int8_t rxPin = KukirinG3Pro::Pins::DispRx,
@@ -122,19 +110,14 @@ public:
         }
     }
 
-    /**
-     * @brief Initializes UART serial port at 9600 8N1.
-     */
+    /** @brief Opens the UART, 8N1. */
     void begin(uint32_t baudRate = 9600) {
         if (_port != nullptr) {
             _port->begin(baudRate, SERIAL_8N1, _rxPin, _txPin);
         }
     }
 
-    /**
-     * @brief Initializes physical GPIO pins for lighting and accessories safely via AccessoryEngine.
-     * @param[in] pins Configurable pin mapping (defaults to canonical Kukirin G3 Pro pinout).
-     */
+    /** @brief Sets up the light, horn and button pins and enables the accessory outputs in update(). */
     void initGPIO(const KukirinG3Pro::PinConfig& pins = KukirinG3Pro::PinConfig{}) {
         _pins = pins;
         _buttonDsPin = pins.buttonDs;
@@ -142,9 +125,7 @@ public:
         _gpioInitialized = true;
     }
 
-    // =========================================================================
-    // Dynamic Configuration Setters & Getters
-    // =========================================================================
+    // Configuration
     void setTimingConfig(const KukirinG3Pro::BridgeTimingConfig& cfg) {
         if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             _timing = cfg;
@@ -159,16 +140,12 @@ public:
         }
     }
 
-    // =========================================================================
-    // Pattern B: Atomic Transaction Callback Hook
-    // =========================================================================
-    /**
-     * @brief Registers the atomic request-response transaction hook.
-     * @param[in] cb Callback invoked immediately on valid frame receipt.
-     */
+    // Callbacks
+
+    /** @brief Called once per valid frame, before the reply is sent; it can change the reply. */
     void onTransaction(TransactionCallback cb) { _onTransaction = cb; }
 
-    // Optional Granular Callbacks
+    // Called when the value changes
     void onThrottle(ThrottleCallback cb)       { _onThrottle = cb; }
     void onBrake(BrakeCallback cb)             { _onBrake = cb; }
     void onLights(LightsCallback cb)           { _onLights = cb; }
@@ -180,9 +157,7 @@ public:
     void onDual(DualCallback cb)               { _onDual = cb; }
     void onPMenu(PMenuCallback cb)             { _onPMenu = cb; }
 
-    // =========================================================================
-    // Pattern A/C: Thread-Safe State Setters (Cross-Core Safe)
-    // =========================================================================
+    // Reply content (safe from either core)
     void setSpeedMph(float mph) {
         const float cleanMph = (mph >= 0.0f) ? mph : 0.0f;
         _atomicSpeedMph.store(cleanMph, std::memory_order_relaxed);
@@ -216,7 +191,7 @@ public:
     }
 
     void setErrorCode(KukirinG3Pro::ErrorCode code) {
-        _atomicErrorCode.store(static_cast<uint8_t>(code), std::memory_order_relaxed); // Atomic fast-path store
+        _atomicErrorCode.store(static_cast<uint8_t>(code), std::memory_order_relaxed);
         if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             _cachedResponse.errorCode = code;
             xSemaphoreGive(_mutex);
@@ -227,27 +202,25 @@ public:
         setErrorCode(static_cast<KukirinG3Pro::ErrorCode>(code));
     }
 
-    /** @brief Atomic fast-path read of current active error code (0 = None). */
+    /** @brief Error code being shown, as a number (0 = none). */
     inline uint8_t getErrorCodeRaw() const {
         return _atomicErrorCode.load(std::memory_order_relaxed);
     }
 
-    /** @brief Strongly-typed atomic fast-path read of current active error code. */
+    /** @brief Error code being shown. */
     inline KukirinG3Pro::ErrorCode getErrorCode() const {
         return static_cast<KukirinG3Pro::ErrorCode>(_atomicErrorCode.load(std::memory_order_relaxed));
     }
 
     void setTripMode(bool trip) {
-        _atomicTripMode.store(trip, std::memory_order_relaxed); // Atomic fast-path store
+        _atomicTripMode.store(trip, std::memory_order_relaxed);
         if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             _cachedResponse.tripMode = trip;
             xSemaphoreGive(_mutex);
         }
     }
 
-    // =========================================================================
-    // Lock-Free Fast-Path Getters for Core 1 Motor Control Loops
-    // =========================================================================
+    // Latest inputs (std::atomic, safe from either core)
     inline float getNormalizedThrottle() const {
         return _atomicNormalizedThrottle.load(std::memory_order_relaxed);
     }
@@ -322,9 +295,7 @@ public:
         return (lastValid == 0 || (millis() - lastValid > _timing.deadmanTimeoutMs));
     }
 
-    /**
-     * @brief Thread-safe atomic copy of the full handlebar input structure.
-     */
+    /** @brief Copies the latest full input struct. False if the mutex was busy for 5 ms. */
     bool getInputs(KukirinInputs& out) const {
         if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             out = _cachedInputs;
@@ -334,10 +305,7 @@ public:
         return false;
     }
 
-    /**
-     * @brief Performs sliding-window search and resynchronization on ingress buffer.
-     * @return bool True if a valid frame header (0x01 0x14) was located and shifted to buffer index 0.
-     */
+    /** @brief After a bad frame, moves the next frame start in the buffer to the front. True if one was found. */
     bool resyncTXBuffer() {
         const size_t rem = KukirinG3Pro::resyncTXBuffer(_txBuf, sizeof(KukirinG3Pro::TXPacket));
         if (rem > 0) {
@@ -349,31 +317,27 @@ public:
         return false;
     }
 
-    // =========================================================================
-    // Real-Time Execution Engine (Core 1, Non-Blocking)
-    // =========================================================================
     /**
-     * @brief Updates UART streaming, evaluates frame watchdogs, executes callbacks, and transmits responses.
-     * @return bool True if a new complete display packet was received and answered this cycle.
+     * @brief Reads available bytes, answers a complete frame, and updates the accessory outputs. Does not block.
+     * @return True if a frame was received and answered in this call.
      */
     bool update() {
         if (_port == nullptr) return false;
 
         const uint32_t nowMs = millis();
 
-        // Handlebar Pushbutton Processing: Sample physical D/S switch
         if (_gpioInitialized) {
             _processPhysicalButton(nowMs);
             _updateAccessories(nowMs);
         }
 
-        // Framing Watchdog: Purge buffer after silence interval
+        // Drop a partial frame after framingTimeoutMs of silence
         if (_txIdx > 0 && (nowMs - _lastRxByteTime >= _timing.framingTimeoutMs)) {
             _txIdx = 0;
             _inputFilter.resetPending();
         }
 
-        // UART Ingestion: Drain serial ring buffer non-blocking
+        // Read up to MAX_SERIAL_READ_ITERATIONS bytes
         uint16_t iterations = 0;
         while (_port->available() && iterations < KukirinG3Pro::MAX_SERIAL_READ_ITERATIONS) {
             iterations++;
@@ -404,7 +368,7 @@ public:
 
                         const float frameDt = (_lastPacketMs > 0) ? (static_cast<float>(nowMs - _lastPacketMs) / 1000.0f) : 0.1f;
 
-                        // Ingress Validation & Parsing: Unpack frame into local stack inputs if plausible
+                        // A frame with a good checksum but impossible values is answered, but its inputs are not used
                         KukirinInputs localInputs;
                         const bool plausible = KukirinG3Pro::isPlausibleTXPacket(command);
                         if (plausible) {
@@ -414,26 +378,24 @@ public:
                             _unpackInputs(command, localInputs, frameDt);
                         } else {
                             _rejectedPacketCount++;
-                            // Enforce safe stationary neutral defaults on plausibility fault
                             localInputs.frameDt = frameDt;
                             localInputs.packetCount = _packetCounter;
                         }
 
-                        // Response Synthesis: Formulate outgoing telemetry frame (Pattern B callback or cached setters)
+                        // Reply content from the setters...
                         KukirinResponse localResponse;
                         if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
                             localResponse = _cachedResponse;
                             xSemaphoreGive(_mutex);
                         } else {
-                            // Atomic fallback under mutex contention preserves active error codes and state
+                            // Mutex busy: use the atomic copies
                             localResponse.speedMph = _atomicSpeedMph.load(std::memory_order_relaxed);
                             localResponse.dualMode = _atomicDualMode.load(std::memory_order_relaxed);
                             localResponse.errorCode = static_cast<KukirinG3Pro::ErrorCode>(_atomicErrorCode.load(std::memory_order_relaxed));
                             localResponse.tripMode = _atomicTripMode.load(std::memory_order_relaxed);
                         }
 
-                        // Execute Pattern B atomic transaction callback BEFORE publishing inputs
-                        // Ensures downstream listeners (onThrottle, etc.) observe fresh transaction state
+                        // ...or from the transaction callback, which runs before the change callbacks below
                         TransactionCallback txCb = _onTransaction;
                         if (txCb != nullptr) {
                             txCb(localInputs, localResponse);
@@ -447,7 +409,7 @@ public:
                             _publishInputs(localInputs);
                         }
 
-                        // Synchronous Wire Dispatch: Transmit binary response frame (0ms phase lag, satisfies display watchdog)
+                        // Reply right away; the display expects one reply per frame
                         _sendResponse(localResponse, localInputs);
 
                         return true;
@@ -475,7 +437,7 @@ private:
     KukirinInputs     _cachedInputs;
     KukirinResponse   _cachedResponse;
 
-    // Lock-free atomic fast-path variables
+    // Copies readable from either core
     std::atomic<float>    _atomicNormalizedThrottle{0.0f};
     std::atomic<uint16_t> _atomicRawThrottle{0};
     std::atomic<float>    _atomicSpeedMph{0.0f};
@@ -492,7 +454,6 @@ private:
     std::atomic<uint8_t>  _atomicErrorCode{static_cast<uint8_t>(KukirinG3Pro::ErrorCode::None)};
     std::atomic<bool>     _atomicTripMode{false};
 
-    // Centralized library-level input filtering & quorum engine
     KukirinG3Pro::InputFilter _inputFilter;
 
     // Protocol state
@@ -505,16 +466,14 @@ private:
     uint32_t _rejectedPacketCount = 0;
     uint32_t _resyncShiftCount = 0;
 
-    // Configurable Dynamic Parameters
     KukirinG3Pro::BridgeTimingConfig _timing;
     KukirinG3Pro::ThrottleConfig     _throtCfg;
 
-    // Canonical Accessory State & Driving Engine
     KukirinG3Pro::AccessoryEngine _accessoryEngine;
     bool     _dualModeState = true;
     static constexpr uint8_t UNINITIALIZED_GEAR = 0xFF;
     static constexpr uint8_t UNINITIALIZED_SWITCH_MASK = static_cast<uint8_t>(KukirinG3Pro::SwitchMask::Uninitialized);
-    uint8_t  _prevSwitchMask = UNINITIALIZED_SWITCH_MASK; // Forces initial baseline dispatch on first frame
+    uint8_t  _prevSwitchMask = UNINITIALIZED_SWITCH_MASK; // so the first frame reports every switch
     uint16_t _prevRawThrottle = 0xFFFF;
     float    _prevNormalizedThrottle = -1.0f;
     uint8_t  _prevGear = UNINITIALIZED_GEAR;
@@ -535,15 +494,13 @@ private:
     void _unpackInputs(const KukirinG3Pro::TXPacket& tx, KukirinInputs& in, float frameDt) {
         const uint32_t nowMs = millis();
 
-        // Asymmetric Brake Dispatch: Instant 1-frame trip, 2-frame debounced release
+        // Brake first: it zeroes the throttle below
         in.brakeActive = _inputFilter.updateBrake(KukirinG3Pro::isBrakeActive(tx), _timing.brakeReleaseQuorum);
 
-        // Throttle Rate Limiting: Asymmetric positive slew governing with instant brake cutoff
         const uint16_t rawThrot = KukirinG3Pro::extractRawThrottle(tx);
         in.rawThrottle = _inputFilter.updateThrottle(rawThrot, in.brakeActive, _throtCfg);
         in.normalizedThrottle = KukirinG3Pro::normalizeThrottle(in.rawThrottle, _throtCfg);
 
-        // Drive Mode & Function Quorums
         const KukirinG3Pro::DriveMode rawMode = KukirinG3Pro::extractDriveMode(tx);
         const KukirinG3Pro::DriveMode filteredMode = _inputFilter.updateDriveMode(rawMode, _timing.driveModeQuorum);
         in.driveMode = filteredMode;
@@ -554,7 +511,7 @@ private:
         in.lightsActive = (filteredFunc & static_cast<uint8_t>(KukirinG3Pro::FunctionFlag::LightsOn)) != 0;
         in.hornActive = KukirinG3Pro::isHornActive(tx);
 
-        // Configuration Staging: Speed-gated P-menu staging with standstill ARQ resynchronization
+        // P-menu: changes made while moving wait until the vehicle slows down
         const KukirinG3Pro::DecodedSettings decoded = KukirinG3Pro::decodeTx(tx);
         const float curSpeed = _atomicSpeedMph.load(std::memory_order_relaxed);
         const bool throttleNeutral = (in.rawThrottle < _throtCfg.deadbandEngage);
@@ -563,7 +520,6 @@ private:
         in.frameDt = frameDt;
         in.packetCount = _packetCounter;
 
-        // Lighting Qualification: 2-frame turn signal quorum and paced hazard qualification
         const bool rawLeft = KukirinG3Pro::isLeftTurnActive(tx);
         const bool rawRight = KukirinG3Pro::isRightTurnActive(tx);
         _inputFilter.updateTurnAndHazard(rawLeft, rawRight, nowMs, in.leftTurn, in.rightTurn, in.hazardLightsActive,
@@ -571,7 +527,6 @@ private:
     }
 
     void _publishInputs(const KukirinInputs& in) {
-        // Atomic scalar publishing
         _atomicNormalizedThrottle.store(in.normalizedThrottle, std::memory_order_relaxed);
         _atomicRawThrottle.store(in.rawThrottle, std::memory_order_relaxed);
         _atomicBrakeActive.store(in.brakeActive, std::memory_order_relaxed);
@@ -582,13 +537,12 @@ private:
         _atomicHazardActive.store(in.hazardLightsActive, std::memory_order_relaxed);
         _atomicHornActive.store(in.hornActive, std::memory_order_relaxed);
 
-        // Safe full struct copy under bounded mutex
         if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
             _cachedInputs = in;
             xSemaphoreGive(_mutex);
         }
 
-        // Discrete switches bitmask: [0]=Brake, [1]=Lights, [2]=LeftTurn, [3]=RightTurn, [4]=Hazard, [5]=Horn, [6]=Dual
+        // Call the change callbacks for switches that changed
         const uint8_t current_mask = (in.brakeActive ? static_cast<uint8_t>(KukirinG3Pro::SwitchMask::Brake) : 0) |
                                      (in.lightsActive ? static_cast<uint8_t>(KukirinG3Pro::SwitchMask::Lights) : 0) |
                                      (in.leftTurn ? static_cast<uint8_t>(KukirinG3Pro::SwitchMask::LeftTurn) : 0) |
@@ -609,14 +563,13 @@ private:
             if ((changed & static_cast<uint8_t>(KukirinG3Pro::SwitchMask::Dual)) && _onDual)                 _onDual(_dualModeState);
         }
 
-        // Gear / Drive Mode edge detection
         if (in.gear != _prevGear) {
             _prevGear = in.gear;
             if (_onGear) _onGear(in.gear);
             if (_onDriveMode) _onDriveMode(in.driveMode);
         }
 
-        // Throttle change edge / deadband detection (>= 1% or boundary 0% / 100%)
+        // Throttle callback on a change of 1 % or more, or on reaching 0 or full
         const bool throt_changed = (_prevRawThrottle == 0xFFFF) ||
                                    (fabsf(in.normalizedThrottle - _prevNormalizedThrottle) >= 0.01f) ||
                                    (in.normalizedThrottle == 0.0f && _prevNormalizedThrottle > 0.0f) ||
@@ -631,7 +584,7 @@ private:
     }
 
     void _sendResponse(const KukirinResponse& resp, const KukirinInputs& in) {
-        // Calculate discrete speedRaw
+        // Speed shows 0 while the VESC link is lost (E-003)
         uint16_t speedRaw;
         if (resp.errorCode == KukirinG3Pro::ErrorCode::E03_MainController) {
             speedRaw = KukirinG3Pro::SPEED_RAW_STATIONARY;
@@ -639,21 +592,17 @@ private:
             speedRaw = KukirinG3Pro::encodeSpeedRawMph(resp.speedMph, in.settings.wheelInches);
         }
 
-        // Format baseline packed response
         const bool is_keepalive = (resp.errorCode == KukirinG3Pro::ErrorCode::None) && KukirinG3Pro::isKeepaliveFrame(_packetCounter);
         KukirinG3Pro::formatResponsePacket(_rxPacket, speedRaw, resp.dualMode, 0, resp.tripMode, is_keepalive);
 
-        // Apply brake warning icon
         if (in.brakeActive) {
             _rxPacket.systemStatus |= static_cast<uint8_t>(KukirinG3Pro::SystemStatus::Braking);
         }
 
-        // Inject diagnostic error code
         if (resp.errorCode != KukirinG3Pro::ErrorCode::None) {
             KukirinG3Pro::applyErrorCode(_rxPacket, resp.errorCode);
         }
 
-        // 12-byte Bitwise XOR Checksum
         _rxPacket.calculatedStatus = KukirinG3Pro::calculateRXChecksum(_rxPacket);
 
         if (resp.errorCode == KukirinG3Pro::ErrorCode::E06_ReceiverTimeoutCrc) {
