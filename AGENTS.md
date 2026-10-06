@@ -31,9 +31,11 @@ ESP32-WROVER firmware that sits between the Kukirin G3 Pro display (TFM13-FEIMI-
 - Do not invent measurements, dates, test results or motivations. Ask.
 - LispBM safety:
   - Never use `set-handbrake`: it holds current at standstill and heats the motor coils. Braking uses passive current braking.
-  - Never use `foc-beep`: it blocks the calling thread, stalling control and communication.
+  - Never use `foc-beep`: it stops the motor and sleeps the LispBM interpreter for the whole beep, halting every script thread. Use `foc-play-tone`.
   - Never use the 3-argument `canset-current` (with off-delay): VESC firmware 7.00 decodes those CAN fields in the wrong order. Use `canset-current-rel` with an off-delay instead.
 - ESP32 control paths: no `delay()`, no heap allocation (`new`, `malloc`, `String` growth).
+- Control that must keep working when the ESP32 link fails (timeouts, speed limits, motor commands) belongs in the LispBM script, not on the ESP32.
+- Write each fact once. Constants are documented where they are defined; docs link to them.
 - Runtime log tokens contain no square brackets.
 
 ## Writing Style
