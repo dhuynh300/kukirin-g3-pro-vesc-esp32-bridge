@@ -79,7 +79,7 @@ When two faults are active, the display alternates between their codes every sec
 
 ## Braking
 
-Braking is regenerative only, through the VESCs' current braking mode (`set-brake-rel`). Strength comes from the P-menu PB level (0-5), fades in per wheel from 5 to 20 mph, and is zero below 5 mph: in brake mode a VESC applies current against the sign of the measured speed, and near standstill that sign is noise that can drive the wheel. The mechanical brakes stop the scooter. After 1 s stopped with the brake held, hill hold applies the full PB level to resist rolling back. The VESC handbrake mode is not used because it pushes holding current through a stopped motor and heats the coils. Details: [powertrain](powertrain.md).
+Electric braking is regenerative, through the VESCs' current braking mode (`set-brake-rel`). Strength comes from the P-menu PB level (0-5), fades in per wheel from 5 to 20 mph, and is zero below 5 mph, because braking near standstill drove the front wheel forward (cause not confirmed, see [powertrain](powertrain.md#regenerative-braking)). The mechanical brakes stop the scooter. After 1 s stopped with the brake held, hill hold applies the full PB level to resist rolling back; in v1.0.0 this also brakes stopped wheels, a known issue described in [powertrain](powertrain.md#hill-hold-known-issue). The VESC handbrake mode is not used because it pushes holding current through a stopped motor and heats the coils. Details: [powertrain](powertrain.md).
 
 ## Repository Layout
 
