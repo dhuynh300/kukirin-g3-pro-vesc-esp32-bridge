@@ -1,0 +1,18 @@
+{
+  "name": "BTAudio",
+  "version": "0.1.0",
+  "description": "Bluetooth A2DP audio receiver that converts phone audio into 8-bit PCM for VESC motor-coil sound. Planned feature; not used by the current firmware.",
+  "license": "GPL-3.0-only",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    {
+      "name": "ESP32-A2DP",
+      "version": "https://github.com/pschatzmann/ESP32-A2DP.git#79b6f4c7c9e38fa04d8c0c93b4ef2333c3efa613"
+    },
+    {
+      "name": "audio-tools",
+      "version": "https://github.com/pschatzmann/arduino-audio-tools.git#473a8090a55e301c7896dfc5868f6080d7fbb372"
+    }
+  ]
+}
