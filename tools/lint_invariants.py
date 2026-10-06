@@ -29,7 +29,7 @@ CONTROL_CODE_DIRS = ("src/", "lib/KukirinDisplay/", "lib/VESCBridge/")
 CPP_EXT = (".cpp", ".h", ".hpp", ".c")
 TEXT_EXT = CPP_EXT + (".lbm", ".py", ".md", ".ini", ".json", ".txt", ".yml", ".yaml", ".csv")
 
-EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿⬀-⯿️]")
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27bf\u2b00-\u2bff\ufe0f]")
 NUMBERED_HEADING = re.compile(r"^#{1,6}\s+(\d+(\.\d+)*[.)]?|[A-Z][.)])\s")
 CREDENTIAL = re.compile(
     r"(?i)\b(pass(word|wd)?|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|wifi[_-]?pass\w*)\b"
