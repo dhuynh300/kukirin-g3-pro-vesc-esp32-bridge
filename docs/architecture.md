@@ -83,14 +83,4 @@ Electric braking is regenerative, through the VESCs' current braking mode (`set-
 
 ## Repository Layout
 
-| Path | Contents |
-|---|---|
-| `src/main.cpp` | ESP32 application |
-| `lib/KukirinDisplay/` | Display protocol and driver |
-| `lib/VESCBridge/` | VESC serial link and safety supervisor |
-| `lib/BTAudio/` | Planned motor-coil audio, not used by the firmware |
-| `vesc/main.lbm` | Rear VESC script |
-| `test/` | Unit tests run on a PC (`pio test -e native`) |
-| `tools/` | Lint, constant cross-check, firmware comparison |
-| `docs/` | This documentation |
-| `third_party/` | Pinned upstream sources: VESC firmware and VESC Tool, LispBM, Junk495's G2 Pro work |
+See the [README](../README.md#repository-layout).
