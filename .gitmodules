@@ -1,0 +1,15 @@
+[submodule "third_party/vesc_firmware_v7"]
+	path = third_party/vesc_firmware_v7
+	url = https://github.com/vedderb/bldc.git
+[submodule "third_party/vesc_tool_release_7_00"]
+	path = third_party/vesc_tool_release_7_00
+	url = https://github.com/vedderb/vesc_tool.git
+[submodule "third_party/lispbm"]
+	path = third_party/lispbm
+	url = https://github.com/svenssonjoel/lispBM.git
+[submodule "third_party/junk495_g2_esp32_bridge"]
+	path = third_party/junk495_g2_esp32_bridge
+	url = https://github.com/junk495/KukirinG2Pro-ESP32-Bridge.git
+[submodule "third_party/junk495_g2_pro_protocol"]
+	path = third_party/junk495_g2_pro_protocol
+	url = https://github.com/junk495/Kukirin-G2-Pro---UART-Communication-Protocol.git
