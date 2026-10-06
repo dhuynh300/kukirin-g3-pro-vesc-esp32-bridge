@@ -1,0 +1,853 @@
+;; =============================================================================
+;; @file main.lbm
+;; @brief Kukirin G3 Pro Custom Firmware - Master VESC Locomotive Engine.
+;; @details Core locomotive firmware running on Rear Master VESC (CAN ID 26):
+;;          - Concurrency architecture (3 green threads via spawn):
+;;            * Thread 1: Control & Actuation Engine (100 Hz / 10ms loop).
+;;            * Thread 2: Telemetry TX Engine (50 Hz / 20ms loop).
+;;            * Thread 3: CAN Health Supervisor (10 Hz / 100ms loop).
+;;          - Relative current drive & electronic regenerative braking scaling (0..120A).
+;;          - Arming-edge dynamic configuration sync (conf-get 'l-current-max / 'l-current-min).
+;;          - Non-blocking 4-note BLHeli drone startup chime (foc-play-tone 2.0-3.5V) on B2S arming.
+;;          - Stationary arming interlock: neutral throttle (<1%) and stationary (<300 ERPM).
+;;          - Direct physical killswitch monitoring on COMM ADC2 (<1.65V = killed/fail-closed).
+;;          - Front Slave VESC (CAN ID 123) control & autonomous 100ms CAN health watchdog.
+;;          - Ground-truth speedometer calibration via native VESC (get-speed).
+;;          - Bracketless change-only diagnostic token logging.
+;; @target VESC Firmware v7.00+
+;;
+;; ! KNOWN PITFALLS & FAILURE MODES:
+;; ! - P08 [Passive Current Braking Mandate]: Electronic braking and hill stop assist strictly use
+;; !   passive current braking (set-brake-rel / canset-brake-rel / set-current 0.0). NEVER use
+;; !   active handbrake (set-handbrake / CONTROL_MODE_HANDBRAKE) which actively sinks holding current
+;; !   at 0 RPM, rapidly causing thermal runaway in motor coils and battery drain.
+;; ! - P07 [Low-Speed Sensor Noise / Regen Runaway]: Below 5.0 mph (2.235 m/s), regen must clamp strictly
+;; !   to 0.0 (set-current 0.0). When front effective brake is 0.0, command (canset-current CAN-ID-FRONT-VESC 0.0)
+;; !   instead of canset-brake-rel; negative speed sensor noise in CONTROL_MODE_CURRENT_BRAKE
+;; !   (iq = -SIGN(speed) * brake_current) will inject forward drive torque and spin up the stationary front wheel!
+;; ! - P06 [1WD Front Motor Isolation]: In 1WD (dual-mode == 0), front motor must strictly receive
+;; !   (canset-current CAN-ID-FRONT-VESC 0.0) across all drive and neutral states (0% duty, 0A draw).
+;; ! - P10 [Dead-Man Watchdog & ZOH]: Silence >= 100ms (5 missed frames) MUST cut motor current to 0.0A.
+;; !   Ticks 1-4 maintain Pure Zero-Order Hold (ZOH) across active targets to prevent torque dropouts.
+;; ! - P02 [Killswitch ADC2 Threshold]: Physical killswitch on COMM ADC2 (get-adc 1) < 1.65V is treated
+;; !   as fail-closed disarmed / emergency stop / severed wire. Motors cut immediately.
+;; ! - P04 [Zero Runtime Buffer Allocation]: All buffers must be pre-allocated once at load-time using bufcreate.
+;; !   Dynamic allocation inside spawned loops triggers GC stalls and FreeRTOS task starvation.
+;; ! - P05 [Unboxed Integer vs Float Math]: 28-bit integer operations (to-i, floor) vs float math (to-float).
+;; !   Never divide integers expecting floating results without explicit conversion.
+;; =============================================================================
+
+;; =============================================================================
+;; User Hardware & Topology Configuration
+;; =============================================================================
+;; User-configurable CAN bus node identifiers and communication parameters:
+(def CAN-ID-REAR-VESC  26)     ; Master Rear VESC (Local execution on UART1)
+(def CAN-ID-FRONT-VESC 123)    ; Slave Front VESC (CAN bus remote node)
+(def VESC-UART-BAUD    230400) ; High-speed UART baud rate matching ESP32 Core 1
+
+;; Initialize UART1 at configured baud rate
+(uart-start VESC-UART-BAUD)
+
+(puts "V:Init:230.4k:26+123")
+
+;; =============================================================================
+;; Firmware Versioning & Build Information
+;; =============================================================================
+(def SCRIPT-VERSION "v1.0.0")
+(def SCRIPT-BUILD   "2026-10-01 17:15")
+(def esp-fw-version "unknown")
+(def esp-build-time "unknown")
+
+;; CLI Terminal Version Query Helper
+(defun ver ()
+    {
+        (puts (str-merge "VESC LispBM: " SCRIPT-VERSION " (" SCRIPT-BUILD ")"))
+        (puts (str-merge "ESP32 Bridge: " esp-fw-version " (" esp-build-time ")"))
+    }
+)
+
+;; =============================================================================
+;; Load-Time Constexpr Physical Derivations & Protocol Constants
+;; =============================================================================
+(def START-1 170) ; 0xAA
+(def START-2 85)  ; 0x55
+(def MSG-HEARTBEAT 0)
+(def MSG-CONTROL   1)
+(def MSG-AUDIO     2)
+(def MSG-TELEM     3)
+(def MSG-DEBUG-LOG 6)
+
+;; CAN Bus Node Identifiers centralized in User Hardware Configuration block at top of file
+
+;; Physical Vehicle Dimensions & Stationary Envelopes
+(def WHEEL-DIAMETER-INCHES 10.0)
+(def MOTOR-POLE-PAIRS 15)
+(def SPEED-STATIONARY-MPH 0.6)
+(def SPEED-STATIONARY-MPS (* SPEED-STATIONARY-MPH 0.44704)) ; 0.268224 m/s
+(def SPEED-STATIONARY-ERPM 300) ; ~0.6 mph with 10" wheel and 15 pole pairs
+(def SPEED-STANDSTILL-MPS SPEED-STATIONARY-MPS)
+
+;; Throttle Count Boundaries (Unboxed 28-bit Integer Discipline)
+(def THROTTLE-SCALE-MAX 10000)
+(def THROTTLE-NEUTRAL-COUNTS 100) ; 1.0% deadband threshold
+
+;; Speed-Scaled Regen & Hill Stop Assist Constants
+(def SPEED-REGEN-MIN-MPS 2.235) ; 5.0 mph user-tested (cutoff threshold)
+(def SPEED-REGEN-MAX-MPS 8.941) ; 20.0 mph (full PB threshold)
+(def REGEN-LERP-RANGE-MPS (- SPEED-REGEN-MAX-MPS SPEED-REGEN-MIN-MPS)) ; 6.706 m/s
+(def INV-REGEN-RANGE (/ 1.0 REGEN-LERP-RANGE-MPS)) ; Reciprocal for fast multiplication
+
+(def SPEED-ROLL-THRESH-ERPM 500) ; 500 ERPM (~1.0 mph rolling threshold)
+(def COAST-OFF-DELAY-SEC    1.0) ; 1.0s modulation off-delay for smooth rotor tracking
+(def SPEED-LIMIT-TAPER-MPS  1.341) ; 3.0 mph speed governor taper window
+
+;; =============================================================================
+;; Pre-allocated Static Buffers (Zero Dynamic Allocation Invariant)
+;; =============================================================================
+(def rx-header (bufcreate 2))     ; Frame start markers
+(def rx-frame (bufcreate 135))    ; Contiguous buffer for type, len, payload, CRC
+(def rx-crc (bufcreate 2))        ; Incoming CRC16 high/low bytes
+(def tx-payload (bufcreate 5))    ; Outgoing telemetry: [type, len, speed_L, speed_H, fault_flags]
+(def tx-telem (bufcreate 9))      ; Complete frame: [START-1, START-2, payload(5 bytes), crc_H, crc_L]
+(def log-str-buf (bufcreate 125)) ; Max ASCII debug log is 120B
+
+;; Initialize Outgoing Telemetry Headers
+(bufset-u8 tx-telem 0 START-1)
+(bufset-u8 tx-telem 1 START-2)
+(bufset-u8 tx-payload 0 MSG-TELEM)
+(bufset-u8 tx-payload 1 3) ; Length = 3 bytes (int16_t speed + uint8_t fault_flags)
+(bufset-u8 tx-payload 4 0) ; fault_flags: Bit 0 = CAN Desync (E-017)
+
+;; =============================================================================
+;; Drivetrain Safety & State Variables (Unboxed 28-bit Integers)
+;; =============================================================================
+(def boot-locked t)            ; Unarmed / Killswitch Locked state (requires B2S to arm)
+(def conf-max-current 120.0)   ; Live motor max current (updated on arming edge)
+(def conf-min-current -120.0)  ; Live motor min regen current (updated on arming edge)
+(def last-rx-time (systime))
+(def missed-ticks 0)
+(def drop-dbg-verbose nil)     ; Packet loss verbose logging toggle (t = log single drops, nil = streak only)
+(def front-vesc-online t)
+(def current-rear-cmd 0.0)
+(def current-front-cmd 0.0)
+
+;; Unboxed High-Frequency Actuation Variables
+(def target-throt 0)           ; Target throttle from ESP32 (0..10000)
+(def actual-throt 0)           ; Commanded motor throttle (0..10000)
+(def target-brake 0)           ; Target brake from ESP32 (0..10000)
+(def actual-brake 0)           ; Commanded brake (0..10000)
+(def active-dual-mode 1)       ; 0 = 1WD (Rear only), 1 = 2WD (Dual)
+(def active-speed-limit 0)     ; Speed limit in cm/s (0 = unlimited)
+
+;; Standstill Hill Stop Assist State
+(def standstill-start-time 0)   ; Timestamp when vehicle reached standstill with brakes held
+(def stop-assist-active    nil) ; True when held stationary for >= 1.0s on brake
+
+;; Change-Only Diagnostic Tracking (Unboxed Integers)
+(def last-log-throt -1)
+(def last-log-brake -1)
+(def last-log-dual -1)
+(def last-log-state -1)        ; 0=IDLE, 1=DRV, 2=BRK, 3=KILL, 4=LOCK, 5=CUT
+(def last-fault-code 0)
+(def last-log-clamped nil)
+
+@const-start
+
+;; =============================================================================
+;; Ultra-Compact camelCase FOC Fault Code Naming
+;; =============================================================================
+(defun log-fault (code)
+    (if (= code 1) (puts "V:Fault:OverV:E2")
+    (if (= code 2) (puts "V:Fault:UnderV:E2")
+    (if (= code 3) (puts "V:Fault:Drv:E2")
+    (if (= code 4) (puts "V:Fault:AbsOc:E2")
+    (if (= code 5) (puts "V:Fault:OtFet:E2")
+    (if (= code 6) (puts "V:Fault:OtMot:E2")
+    (if (= code 18) (puts "V:Fault:UnbalI:E2")
+    (puts "V:Fault:Generic:E2"))))))))
+)
+
+;; =============================================================================
+;; Classic 4-Note RC Drone ESC Startup Chime: D5 -> F#5 -> A5 -> D6 (Long Final Note)
+;; =============================================================================
+(defun play-drone-startup ()
+    {
+        ;; Low tone (D5: 587.33 Hz)
+        (if (not boot-locked) (foc-play-tone 0 587.33 2.5))
+        (sleep 0.08)
+
+        ;; Mid tone (F#5: 739.99 Hz)
+        (if (not boot-locked) (foc-play-tone 0 739.99 3.0))
+        (sleep 0.08)
+
+        ;; High tone (A5: 880.00 Hz)
+        (if (not boot-locked) (foc-play-tone 0 880.00 3.5))
+        (sleep 0.08)
+
+        ;; Cadence pause
+        (sleep 0.05)
+
+        ;; Confirmation tone (D6: 1174.66 Hz, Long)
+        (if (not boot-locked) (foc-play-tone 0 1174.66 4.0))
+        (sleep 0.25)
+        (foc-play-stop)
+    }
+)
+
+;; =============================================================================
+;; Safety Motor Cutoff (Solely invoked by Thread 1)
+;; =============================================================================
+(defun cut-motors ()
+    {
+        (set-current 0.0)
+        (if front-vesc-online
+            (canset-current CAN-ID-FRONT-VESC 0.0)
+        )
+        (setq current-rear-cmd 0.0)
+        (setq current-front-cmd 0.0)
+        (setq target-throt 0)
+        (setq actual-throt 0)
+        (setq target-brake 0)
+        (setq actual-brake 0)
+        (setq stop-assist-active nil)
+        (setq standstill-start-time 0)
+    }
+)
+
+;; =============================================================================
+;; Thread 1: Primary Powertrain & Telemetry Engine (50 Hz / 20ms loop)
+;; Actuation, speed governing, dead-man watchdog, and telemetry TX in 1:1 lockstep
+;; =============================================================================
+(defun thd-powertrain-50hz ()
+    (loopwhile t
+        {
+            (var t-start (systime))
+
+            ;; -------------------------------------------------------------
+            ;; Physical Killswitch Direct Sense (COMM ADC2 / Pin ADC_IND_EXT2)
+            ;;    LOW (<1.65V) = Disarmed / Hardware Trip / Wire Severed
+            ;; -------------------------------------------------------------
+            (var adc-val (get-adc 1))
+            (var kill-pin-low (if adc-val (< adc-val 1.65) t))
+            (if kill-pin-low
+                (if (not boot-locked)
+                    {
+                        (setq boot-locked t)
+                        (cut-motors)
+                        (foc-play-stop)
+                        (if (!= last-log-state 3)
+                            {
+                                (setq last-log-state 3)
+                                (puts "V:Kill:0V:E2")
+                            }
+                        )
+                    }
+                )
+            )
+
+            ;; -------------------------------------------------------------
+            ;; Inverter FOC Hardware Fault Monitor
+            ;; -------------------------------------------------------------
+            (var live-fault (get-fault))
+            (if (!= live-fault last-fault-code)
+                {
+                    (setq last-fault-code live-fault)
+                    (if (> live-fault 0)
+                        (log-fault live-fault)
+                        (puts "V:FaultCleared:E2")
+                    )
+                }
+            )
+
+            ;; -------------------------------------------------------------
+            ;; Read and Synchronize UART Frames (Drains FIFO to latest packet)
+            ;; -------------------------------------------------------------
+            (var keep-reading t)
+            (var has-read nil)
+            (var drain-count 0)
+            (loopwhile keep-reading
+                {
+                    (var read-byte (uart-read rx-header 1 0 nil 0))
+                    (if (> read-byte 0)
+                        (if (= (bufget-u8 rx-header 0) START-1)
+                            {
+                                (var read-b2 (uart-read rx-header 1 1 nil 0))
+                                (if (= read-b2 0)
+                                    {
+                                        (yield 500)
+                                        (setq read-b2 (uart-read rx-header 1 1 nil 0))
+                                    }
+                                )
+                                ;; Absorb duplicate 0xAA start marker (header stutter: 0xAA 0xAA 0x55)
+                                (if (and (> read-b2 0) (= (bufget-u8 rx-header 1) START-1))
+                                    (setq read-b2 (uart-read rx-header 1 1 nil 0))
+                                )
+                                (if (and (> read-b2 0) (= (bufget-u8 rx-header 1) START-2))
+                                    {
+                                        ;; Read MessageType and Length
+                                        (var read-meta (uart-read rx-frame 2 0 nil 0))
+                                        (if (< read-meta 2)
+                                            {
+                                                (yield 500)
+                                                (setq read-meta (+ read-meta (uart-read rx-frame (- 2 read-meta) read-meta nil 0)))
+                                            }
+                                        )
+                                        (if (= read-meta 2)
+                                            {
+                                                (var msg-type (bufget-u8 rx-frame 0))
+                                                (var msg-len  (bufget-u8 rx-frame 1))
+
+                                                ;; Read Payload (Guarded against buffer overflow)
+                                                (var read-p 0)
+                                                (var read-c 0)
+                                                (if (and (> msg-len 0) (<= msg-len 120))
+                                                    {
+                                                        (setq read-p (uart-read rx-frame msg-len 2 nil 0))
+                                                        (if (< read-p msg-len)
+                                                            {
+                                                                (yield 1000)
+                                                                (setq read-p (+ read-p (uart-read rx-frame (- msg-len read-p) (+ 2 read-p) nil 0)))
+                                                            }
+                                                        )
+                                                        (setq read-c (uart-read rx-crc 2 0 nil 0))
+                                                        (if (< read-c 2)
+                                                            {
+                                                                (yield 500)
+                                                                (setq read-c (+ read-c (uart-read rx-crc (- 2 read-c) read-c nil 0)))
+                                                            }
+                                                        )
+                                                    }
+                                                    (if (= msg-len 0)
+                                                        {
+                                                            (setq read-p 0)
+                                                            (setq read-c (uart-read rx-crc 2 0 nil 0))
+                                                            (if (< read-c 2)
+                                                                {
+                                                                    (yield 500)
+                                                                    (setq read-c (+ read-c (uart-read rx-crc (- 2 read-c) read-c nil 0)))
+                                                                }
+                                                            )
+                                                        }
+                                                        {
+                                                            ;; Discard single byte on invalid length to slide search window
+                                                            (uart-read rx-header 1 0 nil 0)
+                                                        }
+                                                    )
+                                                )
+
+                                                (if (and (= read-p msg-len) (= read-c 2))
+                                                    {
+                                                        (var exp-crc (crc16 rx-frame (+ 2 msg-len)))
+                                                        (var got-crc (bufget-u16 rx-crc 0))
+
+                                                        (if (= exp-crc got-crc)
+                                                            {
+                                                                ;; Valid packet received: reset watchdog and streak counters
+                                                                (setq last-rx-time (systime))
+                                                                (setq missed-ticks 0)
+                                                                (setq has-read t)
+
+                                                                ;; Handle MSG_CONTROL (Type 0x01)
+                                                                (if (= msg-type MSG-CONTROL)
+                                                                    {
+                                                                        (var raw-throt (bufget-u16 rx-frame 2 'little-endian))
+                                                                        (var raw-brake (bufget-u16 rx-frame 4 'little-endian))
+                                                                        (var dual-mode (bufget-u8  rx-frame 6))
+                                                                        (var spd-limit (if (>= msg-len 7) (bufget-u16 rx-frame 7 'little-endian) 0))
+
+                                                                        ;; Redundant safety clamp on throttle setpoint
+                                                                        (var clamped-throt (if (> raw-throt THROTTLE-SCALE-MAX) THROTTLE-SCALE-MAX (if (< raw-throt 0) 0 raw-throt)))
+                                                                        (setq target-throt clamped-throt)
+                                                                        (setq target-brake raw-brake)
+                                                                        (setq active-dual-mode dual-mode)
+                                                                        (setq active-speed-limit spd-limit)
+
+                                                                        ;; Log Dual Mode Change
+                                                                        (if (!= dual-mode last-log-dual)
+                                                                            {
+                                                                                (setq last-log-dual dual-mode)
+                                                                                (if (= dual-mode 1)
+                                                                                    (puts "V:Mode:Dual")
+                                                                                    (puts "V:Mode:1WD")
+                                                                                )
+                                                                            }
+                                                                        )
+
+                                                                        ;; Physical Killswitch & Stationary Arming Interlock
+                                                                        (if kill-pin-low
+                                                                            {
+                                                                                (setq boot-locked t)
+                                                                                (cut-motors)
+                                                                            }
+                                                                            {
+                                                                                ;; Arming Sequence: Requires neutral (<1%) and stationary (<300 ERPM)
+                                                                                (if boot-locked
+                                                                                    {
+                                                                                        (var rear-rpm-live (get-rpm))
+                                                                                        (var rear-erpm-abs (if rear-rpm-live (abs (to-float rear-rpm-live)) 0.0))
+                                                                                        (if (and (<= raw-throt THROTTLE-NEUTRAL-COUNTS) (< rear-erpm-abs SPEED-STATIONARY-ERPM))
+                                                                                            {
+                                                                                                (setq boot-locked nil)
+                                                                                                ;; Capture live VESC Tool configuration on arming edge
+                                                                                                (var c-max (conf-get 'l-current-max))
+                                                                                                (if c-max (setq conf-max-current c-max))
+                                                                                                (var c-min (conf-get 'l-current-min))
+                                                                                                (if c-min (setq conf-min-current c-min))
+                                                                                                (spawn play-drone-startup)
+                                                                                                (setq last-log-state 0)
+                                                                                                (puts "V:Armed")
+                                                                                            }
+                                                                                            (cut-motors)
+                                                                                        )
+                                                                                    }
+                                                                                )
+                                                                            }
+                                                                        )
+                                                                    }
+                                                                )
+
+                                                                ;; Handle MSG_DEBUG_LOG (Type 0x06): Tunnel ESP32 ASCII log
+                                                                (if (= msg-type MSG-DEBUG-LOG)
+                                                                    {
+                                                                        (var copy-len (if (> msg-len 120) 120 msg-len))
+                                                                        (bufcpy log-str-buf 0 rx-frame 2 copy-len)
+                                                                        (if (> copy-len 0)
+                                                                            {
+                                                                                (var has-nl (= (bufget-u8 log-str-buf (- copy-len 1)) 10))
+                                                                                (if (not has-nl)
+                                                                                    {
+                                                                                        (bufset-u8 log-str-buf copy-len 10)
+                                                                                        (setq copy-len (+ copy-len 1))
+                                                                                    }
+                                                                                )
+                                                                            }
+                                                                        )
+                                                                        (bufset-u8 log-str-buf copy-len 0)
+                                                                        (puts log-str-buf)
+
+                                                                        ;; Parse Packet Loss Debug Mode toggle
+                                                                        (var idx-drop (str-find log-str-buf "E:DropDbg:"))
+                                                                        (if (>= idx-drop 0)
+                                                                            {
+                                                                                (var mode-char (bufget-u8 log-str-buf (+ idx-drop 10)))
+                                                                                (setq drop-dbg-verbose (= mode-char 49)) ; ASCII '1' == 49
+                                                                            }
+                                                                        )
+
+                                                                        ;; Cache ESP32 Firmware Version broadcast
+                                                                        (var idx-ver (str-find log-str-buf "E:Ver:"))
+                                                                        (if (>= idx-ver 0)
+                                                                            {
+                                                                                (var rem (str-part log-str-buf (+ idx-ver 6)))
+                                                                                (setq esp-fw-version (car (str-split rem "\n\r")))
+                                                                            }
+                                                                            {
+                                                                                (var idx-leg (str-find log-str-buf "Esp32:Version:"))
+                                                                                (if (>= idx-leg 0)
+                                                                                    {
+                                                                                        (var rem (str-part log-str-buf (+ idx-leg 14)))
+                                                                                        (var idx-bld (str-find rem ":Build:"))
+                                                                                        (if (>= idx-bld 0)
+                                                                                            {
+                                                                                                (setq esp-fw-version (str-part rem 0 idx-bld))
+                                                                                                (setq esp-build-time (car (str-split (str-part rem (+ idx-bld 7)) "\n\r")))
+                                                                                            }
+                                                                                            {
+                                                                                                (setq esp-fw-version (car (str-split rem "\n\r")))
+                                                                                            }
+                                                                                        )
+                                                                                    }
+                                                                                    {
+                                                                                        (var idx-fw (str-find log-str-buf "Esp32:Fw:"))
+                                                                                        (if (>= idx-fw 0)
+                                                                                            {
+                                                                                                (var clean-line (car (str-split (str-part log-str-buf (+ idx-fw 9)) "\n\r")))
+                                                                                                (var first-col (str-find clean-line ":"))
+                                                                                                (if (>= first-col 0)
+                                                                                                    {
+                                                                                                        (setq esp-fw-version (str-part clean-line 0 first-col))
+                                                                                                        (setq esp-build-time (str-part clean-line (+ first-col 1)))
+                                                                                                    }
+                                                                                                    (setq esp-fw-version clean-line)
+                                                                                                )
+                                                                                            }
+                                                                                        )
+                                                                                    }
+                                                                                )
+                                                                            }
+                                                                        )
+                                                                    }
+                                                                )
+                                                            }
+                                                            {
+                                                                ;; CRC mismatch: consume single corrupted byte to slide search window
+                                                                (uart-read rx-header 1 0 nil 0)
+                                                            }
+                                                        )
+                                                    }
+                                                    {
+                                                        ;; Incomplete frame: consume single corrupted byte to slide search window
+                                                        (uart-read rx-header 1 0 nil 0)
+                                                    }
+                                                )
+                                            }
+                                        )
+                                    }
+                                )
+                            }
+                            {
+                                ;; First byte was not START-1. If already read a packet this pass, exit loop
+                                (if has-read
+                                    (setq keep-reading nil)
+                                )
+                            }
+                        )
+                        {
+                            ;; No bytes available in FIFO
+                            (setq keep-reading nil)
+                        }
+                    )
+                    (setq drain-count (+ drain-count 1))
+                    (if (> drain-count 10)
+                        (setq keep-reading nil)
+                    )
+                }
+            )
+
+            ;; -------------------------------------------------------------
+            ;; Actuation, Smooth Interpolation & Dead-Man Engine
+            ;; -------------------------------------------------------------
+            (if (or boot-locked kill-pin-low (> live-fault 0))
+                {
+                    (cut-motors)
+                }
+                {
+                    ;; Check Comms Dead-Man Timeout (>= 500ms / 25 missed ticks)
+                    (var delta-rx (secs-since last-rx-time))
+                    (if (>= delta-rx 0.500)
+                        ;; Dead-man Watchdog Cutoff (>= 500ms): 0.0A freewheel
+                        {
+                            (cut-motors)
+                            (foc-play-stop)
+                            (if (!= last-log-state 5)
+                                {
+                                    (setq last-log-state 5)
+                                    (puts "V:DeadmanCut:E3")
+                                }
+                            )
+                        }
+                        ;; Comms Active or Transient Packet Drop (< 500ms): Pure Zero-Order Hold (ZOH)
+                        {
+                            ;; Track and log packet drop streaks (> 1 missed tick in normal mode, >= 1 in verbose mode)
+                            (if (> delta-rx 0.025)
+                                {
+                                    (var cur-missed-ticks (to-i (floor (/ (- delta-rx 0.005) 0.020))))
+                                    (var min-report-ticks (if drop-dbg-verbose 1 2))
+                                    (if (and (>= cur-missed-ticks min-report-ticks) (> cur-missed-ticks missed-ticks))
+                                        {
+                                            (setq missed-ticks cur-missed-ticks)
+                                            (if (= missed-ticks 1) (puts "V:EspDrop:1:E3")
+                                            (if (= missed-ticks 2) (puts "V:EspDrop:2:E3")
+                                            (if (= missed-ticks 3) (puts "V:EspDrop:3:E3")
+                                            (if (= missed-ticks 4) (puts "V:EspDrop:4:E3")
+                                            (puts "V:EspDrop:Streak:E3")))))
+                                        }
+                                    )
+                                }
+                            )
+
+                            ;; Normal actuation with Pure ZOH across active targets (throttle, brake, dual-mode)
+                            ;; Active Brake Priority: Brake unconditionally overrides throttle
+                            (if (> target-brake 0)
+                                {
+                                    (setq actual-throt 0)
+                                    (setq target-throt 0)
+                                    (setq actual-brake target-brake)
+                                    (var brake-ratio (/ (to-float actual-brake) 10000.0))
+                                    (var rear-spd-val (get-speed))
+                                    (var rear-spd-mps (if rear-spd-val (abs (to-float rear-spd-val)) 0.0))
+                                    (var front-spd-val (if front-vesc-online (canget-speed CAN-ID-FRONT-VESC) 0.0))
+                                    (var front-spd-mps (if front-spd-val (abs (to-float front-spd-val)) 0.0))
+
+                                    ;; Evaluate 1.0s Standstill Hill Stop Assist
+                                    (var is-standstill (and (< rear-spd-mps SPEED-STANDSTILL-MPS) (< front-spd-mps SPEED-STANDSTILL-MPS)))
+                                    (if is-standstill
+                                        {
+                                            (if (= standstill-start-time 0)
+                                                (setq standstill-start-time (systime))
+                                            )
+                                            (if (and (not stop-assist-active) (> (secs-since standstill-start-time) 1.0))
+                                                (setq stop-assist-active t)
+                                            )
+                                        }
+                                        {
+                                            (if (not stop-assist-active)
+                                                (setq standstill-start-time 0)
+                                            )
+                                        }
+                                    )
+
+                                    ;; Speed-Scaled Regen Ratio for Rear Wheel
+                                    (var effective-brake-rear brake-ratio)
+                                    (if (not stop-assist-active)
+                                        {
+                                            (var rear-scale 0.0)
+                                            (if (>= rear-spd-mps SPEED-REGEN-MAX-MPS)
+                                                (setq rear-scale 1.0)
+                                                (if (> rear-spd-mps SPEED-REGEN-MIN-MPS)
+                                                    (setq rear-scale (* (- rear-spd-mps SPEED-REGEN-MIN-MPS) INV-REGEN-RANGE))
+                                                    (setq rear-scale 0.0)
+                                                )
+                                            )
+                                            (setq effective-brake-rear (* brake-ratio rear-scale))
+                                        }
+                                    )
+
+                                    ;; Speed-Scaled Regen Ratio for Front Wheel
+                                    (var effective-brake-front brake-ratio)
+                                    (if (not stop-assist-active)
+                                        {
+                                            (var front-scale 0.0)
+                                            (if (>= front-spd-mps SPEED-REGEN-MAX-MPS)
+                                                (setq front-scale 1.0)
+                                                (if (> front-spd-mps SPEED-REGEN-MIN-MPS)
+                                                    (setq front-scale (* (- front-spd-mps SPEED-REGEN-MIN-MPS) INV-REGEN-RANGE))
+                                                    (setq front-scale 0.0)
+                                                )
+                                            )
+                                            (setq effective-brake-front (* brake-ratio front-scale))
+                                        }
+                                    )
+
+                                    ;; Dispatch Passive Braking Commands:
+                                    ;; Command (set-current 0.0) when rear effective brake is 0.0 to prevent latching in brake mode
+                                    (if (> effective-brake-rear 0.0)
+                                        (set-brake-rel effective-brake-rear)
+                                        (set-current 0.0)
+                                    )
+                                    (if front-vesc-online
+                                        (if (> effective-brake-front 0.0)
+                                            (canset-brake-rel CAN-ID-FRONT-VESC effective-brake-front)
+                                            (canset-current CAN-ID-FRONT-VESC 0.0)
+                                        )
+                                    )
+                                    (setq current-rear-cmd 0.0)
+                                    (setq current-front-cmd 0.0)
+
+                                    ;; Consolidated Change-Only Brake Log (Transition to Brake)
+                                    (if (!= last-log-state 2)
+                                        {
+                                            (setq last-log-state 2)
+                                            (puts "V:Brk")
+                                        }
+                                    )
+                                }
+                                {
+                                    ;; Reset Stop Assist State on Brake Release
+                                    (setq stop-assist-active nil)
+                                    (setq standstill-start-time 0)
+                                    (setq actual-brake 0)
+
+                                    ;; Drive Torque Dispatch
+                                    (if (> target-throt THROTTLE-NEUTRAL-COUNTS)
+                                        {
+                                            ;; Direct Target Tracking with Lost-Packet Shock Absorber
+                                            (if (<= target-throt actual-throt)
+                                                ;; Instant decel roll-off / release (0ms latency)
+                                                (setq actual-throt target-throt)
+                                                ;; Positive acceleration: direct tracking during healthy comms, clamp only after dropped packets
+                                                (if (or (<= delta-rx 0.035) (<= (- target-throt actual-throt) 2000))
+                                                    {
+                                                        (setq actual-throt target-throt)
+                                                        (setq last-log-clamped nil)
+                                                    }
+                                                    {
+                                                        (setq actual-throt (+ actual-throt 2000))
+                                                        (if (not last-log-clamped)
+                                                            {
+                                                                (setq last-log-clamped t)
+                                                                (puts "V:ShockAbsorber:+2k")
+                                                            }
+                                                        )
+                                                    }
+                                                )
+                                            )
+
+                                            (var throt-ratio (/ (to-float actual-throt) 10000.0))
+                                            (var rear-throt throt-ratio)
+                                            (var front-throt throt-ratio)
+
+                                            ;; VESC Local Per-Motor Speed Limiting (TCS Foundation)
+                                            (if (> active-speed-limit 0)
+                                                {
+                                                    (var lim-mps (/ (to-float active-speed-limit) 100.0))
+                                                    (var taper-start (- lim-mps SPEED-LIMIT-TAPER-MPS))
+
+                                                    ;; Rear Wheel Speed Taper
+                                                    (var rear-spd-val (get-speed))
+                                                    (var rear-spd (if rear-spd-val (abs (to-float rear-spd-val)) 0.0))
+                                                    (if (>= rear-spd lim-mps)
+                                                        (setq rear-throt 0.0)
+                                                        (if (> rear-spd taper-start)
+                                                            (setq rear-throt (* throt-ratio (/ (- lim-mps rear-spd) SPEED-LIMIT-TAPER-MPS)))
+                                                        )
+                                                    )
+
+                                                    ;; Front Wheel Speed Taper
+                                                    (var front-spd-val (if front-vesc-online (canget-speed CAN-ID-FRONT-VESC) 0.0))
+                                                    (var front-spd (if front-spd-val (abs (to-float front-spd-val)) 0.0))
+                                                    (if (>= front-spd lim-mps)
+                                                        (setq front-throt 0.0)
+                                                        (if (> front-spd taper-start)
+                                                            (setq front-throt (* throt-ratio (/ (- lim-mps front-spd) SPEED-LIMIT-TAPER-MPS)))
+                                                        )
+                                                    )
+                                                }
+                                            )
+
+                                            (if (and (= active-dual-mode 1) front-vesc-online)
+                                                {
+                                                    (set-current-rel rear-throt COAST-OFF-DELAY-SEC)
+                                                    (canset-current-rel CAN-ID-FRONT-VESC front-throt COAST-OFF-DELAY-SEC)
+                                                    (setq current-rear-cmd rear-throt)
+                                                    (setq current-front-cmd front-throt)
+                                                }
+                                                {
+                                                    (set-current-rel rear-throt COAST-OFF-DELAY-SEC)
+                                                    (if front-vesc-online
+                                                        (canset-current CAN-ID-FRONT-VESC 0.0)
+                                                    )
+                                                    (setq current-rear-cmd rear-throt)
+                                                    (setq current-front-cmd 0.0)
+                                                }
+                                            )
+
+                                            ;; Consolidated Change-Only Drive Log (Transition to Drive)
+                                            (if (!= last-log-state 1)
+                                                {
+                                                    (setq last-log-state 1)
+                                                    (if (= active-dual-mode 1)
+                                                        (puts "V:Drv:Dual")
+                                                        (puts "V:Drv:1WD")
+                                                    )
+                                                }
+                                            )
+                                        }
+                                        {
+                                            ;; Neutral Freewheel (0.0A with Speed-Governed FOC Tracking)
+                                            (setq actual-throt 0)
+                                            (var rear-rpm-val (get-rpm))
+                                            (var rear-rolling (if rear-rpm-val (> (abs (to-float rear-rpm-val)) SPEED-ROLL-THRESH-ERPM) nil))
+                                            (if rear-rolling
+                                                (set-current 0.0 COAST-OFF-DELAY-SEC)
+                                                (set-current 0.0)
+                                            )
+                                            (if front-vesc-online
+                                                (if (= active-dual-mode 1)
+                                                    {
+                                                        (var front-rpm-val (if front-vesc-online (canget-rpm CAN-ID-FRONT-VESC) 0.0))
+                                                        (var front-rpm (if front-rpm-val (to-float front-rpm-val) 0.0))
+                                                        (var front-rolling (> (abs front-rpm) SPEED-ROLL-THRESH-ERPM))
+                                                        (if front-rolling
+                                                            (canset-current-rel CAN-ID-FRONT-VESC 0.0 COAST-OFF-DELAY-SEC)
+                                                            (canset-current CAN-ID-FRONT-VESC 0.0)
+                                                        )
+                                                    }
+                                                    (canset-current CAN-ID-FRONT-VESC 0.0)
+                                                )
+                                            )
+                                            (setq current-rear-cmd 0.0)
+                                            (setq current-front-cmd 0.0)
+
+                                            (if (!= last-log-state 0)
+                                                {
+                                                    (setq last-log-state 0)
+                                                    (setq last-log-throt 0)
+                                                    (setq last-log-brake 0)
+                                                    (puts "V:Idle")
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+
+            ;; -------------------------------------------------------------
+            ;; Telemetry TX: Fastest-Wheel Speed Arbitration & Status Frame
+            ;; Dispatches 1:1 in synchronous lockstep with received controls
+            ;; -------------------------------------------------------------
+            (var rear-raw (get-speed))
+            (var rear-mps (if rear-raw (abs (to-float rear-raw)) 0.0))
+            (var front-raw (if front-vesc-online (canget-speed CAN-ID-FRONT-VESC) 0.0))
+            (var front-mps (if front-raw (abs (to-float front-raw)) 0.0))
+            (var max-mps (if (> front-mps rear-mps) front-mps rear-mps))
+            (var speed-scaled (to-i (round (* max-mps 100.0))))
+            (if (> speed-scaled 32767) (setq speed-scaled 32767))
+            (if (< speed-scaled -32768) (setq speed-scaled -32768))
+
+            (var can-desync-bit (if front-vesc-online 0 1))
+            (var fault-flags (bitwise-or can-desync-bit (shl (get-fault) 1)))
+            (bufset-u8 tx-payload 4 fault-flags)
+            (bufset-i16 tx-payload 2 speed-scaled 'little-endian)
+            (var tx-crc (crc16 tx-payload 5))
+
+            ;; Copy payload into tx-telem frame and append CRC16
+            (bufcpy tx-telem 2 tx-payload 0 5)
+            (bufset-u16 tx-telem 7 tx-crc)
+
+            ;; Transmit 9-byte telemetry frame over UART
+            (uart-write tx-telem)
+
+            ;; Elapsed-compensated 50.0 Hz loop pacing with native SI seconds
+            (var elapsed (secs-since t-start))
+            (if (< elapsed 0.020)
+                (sleep (- 0.020 elapsed))
+                (yield 1)
+            )
+        }
+    )
+)
+
+;; =============================================================================
+;; Thread 2: CAN Health Supervisor (10 Hz / 100ms loop)
+;; Evaluates (can-msg-age CAN-ID-FRONT-VESC 1), updates atomic front-vesc-online
+;; =============================================================================
+(defun thd-can-supervisor ()
+    (loopwhile t
+        {
+            (var front-age (can-msg-age CAN-ID-FRONT-VESC 1))
+            (if (or (not front-age) (> front-age 0.500))
+                {
+                    (if front-vesc-online
+                        {
+                            (atomic (setq front-vesc-online nil))
+                            (puts "V:FrontTimeout:E17")
+                        }
+                    )
+                }
+                {
+                    (if (not front-vesc-online)
+                        {
+                            (atomic (setq front-vesc-online t))
+                            (puts "V:FrontOnline")
+                        }
+                    )
+                }
+            )
+
+            (sleep 0.100) ; 10 Hz / 100ms loop
+        }
+    )
+)
+
+@const-end
+
+;; =============================================================================
+;; Concurrent Process Spawning (2 Green Threads)
+;; =============================================================================
+(spawn thd-powertrain-50hz)
+(spawn thd-can-supervisor)
