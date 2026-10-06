@@ -1,64 +1,38 @@
-;; =============================================================================
-;; @file main.lbm
-;; @brief Kukirin G3 Pro Custom Firmware - Master VESC Locomotive Engine.
-;; @details Core locomotive firmware running on Rear Master VESC (CAN ID 26):
-;;          - Concurrency architecture (3 green threads via spawn):
-;;            * Thread 1: Control & Actuation Engine (100 Hz / 10ms loop).
-;;            * Thread 2: Telemetry TX Engine (50 Hz / 20ms loop).
-;;            * Thread 3: CAN Health Supervisor (10 Hz / 100ms loop).
-;;          - Relative current drive & electronic regenerative braking scaling (0..120A).
-;;          - Arming-edge dynamic configuration sync (conf-get 'l-current-max / 'l-current-min).
-;;          - Non-blocking 4-note BLHeli drone startup chime (foc-play-tone 2.0-3.5V) on B2S arming.
-;;          - Stationary arming interlock: neutral throttle (<1%) and stationary (<300 ERPM).
-;;          - Direct physical killswitch monitoring on COMM ADC2 (<1.65V = killed/fail-closed).
-;;          - Front Slave VESC (CAN ID 123) control & autonomous 100ms CAN health watchdog.
-;;          - Ground-truth speedometer calibration via native VESC (get-speed).
-;;          - Bracketless change-only diagnostic token logging.
-;; @target VESC Firmware v7.00+
+;; main.lbm: powertrain script for the rear VESC (CAN ID 26), VESC firmware 7.00.
 ;;
-;; ! KNOWN PITFALLS & FAILURE MODES:
-;; ! - P08 [Passive Current Braking Mandate]: Electronic braking and hill stop assist strictly use
-;; !   passive current braking (set-brake-rel / canset-brake-rel / set-current 0.0). NEVER use
-;; !   active handbrake (set-handbrake / CONTROL_MODE_HANDBRAKE) which actively sinks holding current
-;; !   at 0 RPM, rapidly causing thermal runaway in motor coils and battery drain.
-;; ! - P07 [Low-Speed Sensor Noise / Regen Runaway]: Below 5.0 mph (2.235 m/s), regen must clamp strictly
-;; !   to 0.0 (set-current 0.0). When front effective brake is 0.0, command (canset-current CAN-ID-FRONT-VESC 0.0)
-;; !   instead of canset-brake-rel; negative speed sensor noise in CONTROL_MODE_CURRENT_BRAKE
-;; !   (iq = -SIGN(speed) * brake_current) will inject forward drive torque and spin up the stationary front wheel!
-;; ! - P06 [1WD Front Motor Isolation]: In 1WD (dual-mode == 0), front motor must strictly receive
-;; !   (canset-current CAN-ID-FRONT-VESC 0.0) across all drive and neutral states (0% duty, 0A draw).
-;; ! - P10 [Dead-Man Watchdog & ZOH]: Silence >= 100ms (5 missed frames) MUST cut motor current to 0.0A.
-;; !   Ticks 1-4 maintain Pure Zero-Order Hold (ZOH) across active targets to prevent torque dropouts.
-;; ! - P02 [Killswitch ADC2 Threshold]: Physical killswitch on COMM ADC2 (get-adc 1) < 1.65V is treated
-;; !   as fail-closed disarmed / emergency stop / severed wire. Motors cut immediately.
-;; ! - P04 [Zero Runtime Buffer Allocation]: All buffers must be pre-allocated once at load-time using bufcreate.
-;; !   Dynamic allocation inside spawned loops triggers GC stalls and FreeRTOS task starvation.
-;; ! - P05 [Unboxed Integer vs Float Math]: 28-bit integer operations (to-i, floor) vs float math (to-float).
-;; !   Never divide integers expecting floating results without explicit conversion.
-;; =============================================================================
+;; The ESP32 sends control frames over UART (throttle, brake, dual drive, speed limit). This script turns
+;; them into current commands for the rear motor and, over CAN, the front VESC (CAN ID 123), and sends
+;; speed and fault telemetry back. Two threads:
+;;   thd-powertrain-50hz  every 20 ms: killswitch, faults, UART frames, dead-man, drive/brake, telemetry
+;;   thd-can-supervisor   every 100 ms: marks the front VESC offline after 500 ms without CAN status
+;;
+;; Rules for editing this file:
+;;   - Never use set-handbrake: it pushes holding current at standstill and heats the motor coils.
+;;     Braking uses passive current braking (set-brake-rel / canset-brake-rel).
+;;   - Never use foc-beep: it stops the motor, reconfigures FOC and sleeps the interpreter for the whole
+;;     beep (mcpwm_foc_beep in the VESC source), which halts every thread in this script. Use foc-play-tone.
+;;   - Never call canset-current with an off-delay: VESC 7.00 decodes those CAN fields in the wrong order
+;;     (a 1.0 s off-delay arrives as 1.0 A). Use canset-current-rel with the off-delay instead.
+;;   - Allocate buffers once with bufcreate at load time; allocation inside the loops causes GC pauses.
+;;   - Integer and float math differ: convert with to-float before dividing when a fraction is needed.
+;;   - Constants also defined in the ESP32 code are checked by tools/check_shared_constants.py.
 
-;; =============================================================================
-;; User Hardware & Topology Configuration
-;; =============================================================================
-;; User-configurable CAN bus node identifiers and communication parameters:
-(def CAN-ID-REAR-VESC  26)     ; Master Rear VESC (Local execution on UART1)
-(def CAN-ID-FRONT-VESC 123)    ; Slave Front VESC (CAN bus remote node)
-(def VESC-UART-BAUD    230400) ; High-speed UART baud rate matching ESP32 Core 1
+;; Link settings
+(def CAN-ID-REAR-VESC  26)     ; this VESC
+(def CAN-ID-FRONT-VESC 123)    ; front VESC, commanded over CAN
+(def VESC-UART-BAUD    230400) ; must match the ESP32
 
-;; Initialize UART1 at configured baud rate
 (uart-start VESC-UART-BAUD)
 
 (puts "V:Init:230.4k:26+123")
 
-;; =============================================================================
-;; Firmware Versioning & Build Information
-;; =============================================================================
+;; Version (the ESP32 version is filled in from its log messages)
 (def SCRIPT-VERSION "v1.0.0")
 (def SCRIPT-BUILD   "2026-10-01 17:15")
 (def esp-fw-version "unknown")
 (def esp-build-time "unknown")
 
-;; CLI Terminal Version Query Helper
+;; (ver) in the VESC Tool terminal prints both versions
 (defun ver ()
     {
         (puts (str-merge "VESC LispBM: " SCRIPT-VERSION " (" SCRIPT-BUILD ")"))
@@ -66,9 +40,7 @@
     }
 )
 
-;; =============================================================================
-;; Load-Time Constexpr Physical Derivations & Protocol Constants
-;; =============================================================================
+;; UART frame: START-1 START-2 type length payload CRC16 (same format as the ESP32 side)
 (def START-1 170) ; 0xAA
 (def START-2 85)  ; 0x55
 (def MSG-HEARTBEAT 0)
@@ -77,73 +49,66 @@
 (def MSG-TELEM     3)
 (def MSG-DEBUG-LOG 6)
 
-;; CAN Bus Node Identifiers centralized in User Hardware Configuration block at top of file
 
-;; Physical Vehicle Dimensions & Stationary Envelopes
+;; Vehicle (wheel size and poles are documentation here; speeds come from the VESC Tool settings)
 (def WHEEL-DIAMETER-INCHES 10.0)
 (def MOTOR-POLE-PAIRS 15)
 (def SPEED-STATIONARY-MPH 0.6)
 (def SPEED-STATIONARY-MPS (* SPEED-STATIONARY-MPH 0.44704)) ; 0.268224 m/s
-(def SPEED-STATIONARY-ERPM 300) ; ~0.6 mph with 10" wheel and 15 pole pairs
+(def SPEED-STATIONARY-ERPM 300) ; about 0.6 mph with a 10 in wheel and 15 pole pairs
 (def SPEED-STANDSTILL-MPS SPEED-STATIONARY-MPS)
 
-;; Throttle Count Boundaries (Unboxed 28-bit Integer Discipline)
+;; Throttle and brake commands are 0..10000 counts = 0..100 % of the motor current limit in VESC Tool
 (def THROTTLE-SCALE-MAX 10000)
-(def THROTTLE-NEUTRAL-COUNTS 100) ; 1.0% deadband threshold
+(def THROTTLE-NEUTRAL-COUNTS 100) ; below 1 %: freewheel, and the level needed to arm
 
-;; Speed-Scaled Regen & Hill Stop Assist Constants
-(def SPEED-REGEN-MIN-MPS 2.235) ; 5.0 mph user-tested (cutoff threshold)
-(def SPEED-REGEN-MAX-MPS 8.941) ; 20.0 mph (full PB threshold)
+;; Regen fades in per wheel between these speeds; below the lower one there is no regen
+(def SPEED-REGEN-MIN-MPS 2.235) ; 5.0 mph, set from ride testing
+(def SPEED-REGEN-MAX-MPS 8.941) ; 20.0 mph, full PB level above this
 (def REGEN-LERP-RANGE-MPS (- SPEED-REGEN-MAX-MPS SPEED-REGEN-MIN-MPS)) ; 6.706 m/s
-(def INV-REGEN-RANGE (/ 1.0 REGEN-LERP-RANGE-MPS)) ; Reciprocal for fast multiplication
+(def INV-REGEN-RANGE (/ 1.0 REGEN-LERP-RANGE-MPS)) ; multiply instead of divide in the loop
 
-(def SPEED-ROLL-THRESH-ERPM 500) ; 500 ERPM (~1.0 mph rolling threshold)
-(def COAST-OFF-DELAY-SEC    1.0) ; 1.0s modulation off-delay for smooth rotor tracking
-(def SPEED-LIMIT-TAPER-MPS  1.341) ; 3.0 mph speed governor taper window
+(def SPEED-ROLL-THRESH-ERPM 500) ; about 1 mph: above this a wheel counts as rolling
+(def COAST-OFF-DELAY-SEC    1.0) ; keep modulating for 1 s after current goes to 0, so throttle re-engages smoothly
+(def SPEED-LIMIT-TAPER-MPS  1.341) ; 3.0 mph: drive fades to 0 over this window below the limit
 
-;; =============================================================================
-;; Pre-allocated Static Buffers (Zero Dynamic Allocation Invariant)
-;; =============================================================================
-(def rx-header (bufcreate 2))     ; Frame start markers
-(def rx-frame (bufcreate 135))    ; Contiguous buffer for type, len, payload, CRC
-(def rx-crc (bufcreate 2))        ; Incoming CRC16 high/low bytes
-(def tx-payload (bufcreate 5))    ; Outgoing telemetry: [type, len, speed_L, speed_H, fault_flags]
-(def tx-telem (bufcreate 9))      ; Complete frame: [START-1, START-2, payload(5 bytes), crc_H, crc_L]
-(def log-str-buf (bufcreate 125)) ; Max ASCII debug log is 120B
+;; Buffers, allocated once
+(def rx-header (bufcreate 2))     ; start bytes
+(def rx-frame (bufcreate 135))    ; type, length, payload
+(def rx-crc (bufcreate 2))        ; received CRC
+(def tx-payload (bufcreate 5))    ; telemetry: type, length, speed (2 bytes, little-endian), fault flags
+(def tx-telem (bufcreate 9))      ; whole telemetry frame
+(def log-str-buf (bufcreate 125)) ; ESP32 log lines are at most 120 bytes
 
-;; Initialize Outgoing Telemetry Headers
 (bufset-u8 tx-telem 0 START-1)
 (bufset-u8 tx-telem 1 START-2)
 (bufset-u8 tx-payload 0 MSG-TELEM)
-(bufset-u8 tx-payload 1 3) ; Length = 3 bytes (int16_t speed + uint8_t fault_flags)
-(bufset-u8 tx-payload 4 0) ; fault_flags: Bit 0 = CAN Desync (E-017)
+(bufset-u8 tx-payload 1 3)
+(bufset-u8 tx-payload 4 0) ; fault flags: bit 0 front VESC lost, bits 1-7 this VESC's fault code
 
-;; =============================================================================
-;; Drivetrain Safety & State Variables (Unboxed 28-bit Integers)
-;; =============================================================================
-(def boot-locked t)            ; Unarmed / Killswitch Locked state (requires B2S to arm)
-(def conf-max-current 120.0)   ; Live motor max current (updated on arming edge)
-(def conf-min-current -120.0)  ; Live motor min regen current (updated on arming edge)
+;; State
+(def boot-locked t)            ; unarmed: motors off until arming (see the control frame handler)
+(def conf-max-current 120.0)   ; read from the motor config when arming; not used otherwise
+(def conf-min-current -120.0)  ; same
 (def last-rx-time (systime))
 (def missed-ticks 0)
-(def drop-dbg-verbose nil)     ; Packet loss verbose logging toggle (t = log single drops, nil = streak only)
+(def drop-dbg-verbose nil)     ; t: log single missing frames, nil: only two or more (set from the ESP32 console)
 (def front-vesc-online t)
 (def current-rear-cmd 0.0)
 (def current-front-cmd 0.0)
 
-;; Unboxed High-Frequency Actuation Variables
-(def target-throt 0)           ; Target throttle from ESP32 (0..10000)
-(def actual-throt 0)           ; Commanded motor throttle (0..10000)
-(def target-brake 0)           ; Target brake from ESP32 (0..10000)
-(def actual-brake 0)           ; Commanded brake (0..10000)
-(def active-dual-mode 1)       ; 0 = 1WD (Rear only), 1 = 2WD (Dual)
-(def active-speed-limit 0)     ; Speed limit in cm/s (0 = unlimited)
+(def target-throt 0)           ; last throttle from the ESP32
+(def actual-throt 0)           ; throttle applied
+(def target-brake 0)           ; last brake from the ESP32
+(def actual-brake 0)           ; brake applied
+(def active-dual-mode 1)       ; 1 both motors, 0 rear only
+(def active-speed-limit 0)     ; cm/s, 0 = no limit
 
-;; Standstill Hill Stop Assist State
-(def standstill-start-time 0)   ; Timestamp when vehicle reached standstill with brakes held
-(def stop-assist-active    nil) ; True when held stationary for >= 1.0s on brake
+;; Hill hold: after 1 s stopped with the brake held, brake at the full PB level until the brake is released
+(def standstill-start-time 0)
+(def stop-assist-active    nil)
 
-;; Change-Only Diagnostic Tracking (Unboxed Integers)
+;; Logged only on change
 (def last-log-throt -1)
 (def last-log-brake -1)
 (def last-log-dual -1)
@@ -153,9 +118,7 @@
 
 @const-start
 
-;; =============================================================================
-;; Ultra-Compact camelCase FOC Fault Code Naming
-;; =============================================================================
+;; Log a VESC fault code by name
 (defun log-fault (code)
     (if (= code 1) (puts "V:Fault:OverV:E2")
     (if (= code 2) (puts "V:Fault:UnderV:E2")
@@ -167,36 +130,28 @@
     (puts "V:Fault:Generic:E2"))))))))
 )
 
-;; =============================================================================
-;; Classic 4-Note RC Drone ESC Startup Chime: D5 -> F#5 -> A5 -> D6 (Long Final Note)
-;; =============================================================================
+;; Arming chime through the motor coils (D5, F#5, A5, D6). Runs in its own thread so the sleeps do not
+;; stall control; each tone is skipped if the vehicle was disarmed meanwhile.
 (defun play-drone-startup ()
     {
-        ;; Low tone (D5: 587.33 Hz)
         (if (not boot-locked) (foc-play-tone 0 587.33 2.5))
         (sleep 0.08)
 
-        ;; Mid tone (F#5: 739.99 Hz)
         (if (not boot-locked) (foc-play-tone 0 739.99 3.0))
         (sleep 0.08)
 
-        ;; High tone (A5: 880.00 Hz)
         (if (not boot-locked) (foc-play-tone 0 880.00 3.5))
         (sleep 0.08)
 
-        ;; Cadence pause
         (sleep 0.05)
 
-        ;; Confirmation tone (D6: 1174.66 Hz, Long)
         (if (not boot-locked) (foc-play-tone 0 1174.66 4.0))
         (sleep 0.25)
         (foc-play-stop)
     }
 )
 
-;; =============================================================================
-;; Safety Motor Cutoff (Solely invoked by Thread 1)
-;; =============================================================================
+;; Zero current on both motors and clear all targets. Called only from the powertrain thread.
 (defun cut-motors ()
     {
         (set-current 0.0)
@@ -214,19 +169,14 @@
     }
 )
 
-;; =============================================================================
-;; Thread 1: Primary Powertrain & Telemetry Engine (50 Hz / 20ms loop)
-;; Actuation, speed governing, dead-man watchdog, and telemetry TX in 1:1 lockstep
-;; =============================================================================
+;; Powertrain thread, every 20 ms
 (defun thd-powertrain-50hz ()
     (loopwhile t
         {
             (var t-start (systime))
 
-            ;; -------------------------------------------------------------
-            ;; Physical Killswitch Direct Sense (COMM ADC2 / Pin ADC_IND_EXT2)
-            ;;    LOW (<1.65V) = Disarmed / Hardware Trip / Wire Severed
-            ;; -------------------------------------------------------------
+            ;; Killswitch: the ESP32 holds ADC2 low (below 1.65 V) until brake-to-start. Low, a cut wire
+            ;; or a failed reading all mean motors off.
             (var adc-val (get-adc 1))
             (var kill-pin-low (if adc-val (< adc-val 1.65) t))
             (if kill-pin-low
@@ -245,9 +195,7 @@
                 )
             )
 
-            ;; -------------------------------------------------------------
-            ;; Inverter FOC Hardware Fault Monitor
-            ;; -------------------------------------------------------------
+            ;; This VESC's fault code (sent to the ESP32 in telemetry)
             (var live-fault (get-fault))
             (if (!= live-fault last-fault-code)
                 {
@@ -259,9 +207,7 @@
                 }
             )
 
-            ;; -------------------------------------------------------------
-            ;; Read and Synchronize UART Frames (Drains FIFO to latest packet)
-            ;; -------------------------------------------------------------
+            ;; Read UART frames: up to 11 per pass, so a backlog is drained and the newest control frame wins
             (var keep-reading t)
             (var has-read nil)
             (var drain-count 0)
@@ -278,13 +224,12 @@
                                         (setq read-b2 (uart-read rx-header 1 1 nil 0))
                                     }
                                 )
-                                ;; Absorb duplicate 0xAA start marker (header stutter: 0xAA 0xAA 0x55)
+                                ;; 0xAA 0xAA 0x55: skip the extra 0xAA
                                 (if (and (> read-b2 0) (= (bufget-u8 rx-header 1) START-1))
                                     (setq read-b2 (uart-read rx-header 1 1 nil 0))
                                 )
                                 (if (and (> read-b2 0) (= (bufget-u8 rx-header 1) START-2))
                                     {
-                                        ;; Read MessageType and Length
                                         (var read-meta (uart-read rx-frame 2 0 nil 0))
                                         (if (< read-meta 2)
                                             {
@@ -297,7 +242,7 @@
                                                 (var msg-type (bufget-u8 rx-frame 0))
                                                 (var msg-len  (bufget-u8 rx-frame 1))
 
-                                                ;; Read Payload (Guarded against buffer overflow)
+                                                ;; Payload of at most 120 bytes
                                                 (var read-p 0)
                                                 (var read-c 0)
                                                 (if (and (> msg-len 0) (<= msg-len 120))
@@ -329,7 +274,7 @@
                                                             )
                                                         }
                                                         {
-                                                            ;; Discard single byte on invalid length to slide search window
+                                                            ;; Bad length: drop one byte and search again
                                                             (uart-read rx-header 1 0 nil 0)
                                                         }
                                                     )
@@ -342,12 +287,11 @@
 
                                                         (if (= exp-crc got-crc)
                                                             {
-                                                                ;; Valid packet received: reset watchdog and streak counters
+                                                                ;; Any valid frame feeds the dead-man timer
                                                                 (setq last-rx-time (systime))
                                                                 (setq missed-ticks 0)
                                                                 (setq has-read t)
 
-                                                                ;; Handle MSG_CONTROL (Type 0x01)
                                                                 (if (= msg-type MSG-CONTROL)
                                                                     {
                                                                         (var raw-throt (bufget-u16 rx-frame 2 'little-endian))
@@ -355,14 +299,12 @@
                                                                         (var dual-mode (bufget-u8  rx-frame 6))
                                                                         (var spd-limit (if (>= msg-len 7) (bufget-u16 rx-frame 7 'little-endian) 0))
 
-                                                                        ;; Redundant safety clamp on throttle setpoint
                                                                         (var clamped-throt (if (> raw-throt THROTTLE-SCALE-MAX) THROTTLE-SCALE-MAX (if (< raw-throt 0) 0 raw-throt)))
                                                                         (setq target-throt clamped-throt)
                                                                         (setq target-brake raw-brake)
                                                                         (setq active-dual-mode dual-mode)
                                                                         (setq active-speed-limit spd-limit)
 
-                                                                        ;; Log Dual Mode Change
                                                                         (if (!= dual-mode last-log-dual)
                                                                             {
                                                                                 (setq last-log-dual dual-mode)
@@ -373,14 +315,15 @@
                                                                             }
                                                                         )
 
-                                                                        ;; Physical Killswitch & Stationary Arming Interlock
                                                                         (if kill-pin-low
                                                                             {
                                                                                 (setq boot-locked t)
                                                                                 (cut-motors)
                                                                             }
                                                                             {
-                                                                                ;; Arming Sequence: Requires neutral (<1%) and stationary (<300 ERPM)
+                                                                                ;; Arm when the killswitch is high, the throttle is released and the rear wheel
+                                                                                ;; is stopped. Brake-to-start itself is checked on the ESP32, which keeps the
+                                                                                ;; killswitch low until then.
                                                                                 (if boot-locked
                                                                                     {
                                                                                         (var rear-rpm-live (get-rpm))
@@ -388,7 +331,6 @@
                                                                                         (if (and (<= raw-throt THROTTLE-NEUTRAL-COUNTS) (< rear-erpm-abs SPEED-STATIONARY-ERPM))
                                                                                             {
                                                                                                 (setq boot-locked nil)
-                                                                                                ;; Capture live VESC Tool configuration on arming edge
                                                                                                 (var c-max (conf-get 'l-current-max))
                                                                                                 (if c-max (setq conf-max-current c-max))
                                                                                                 (var c-min (conf-get 'l-current-min))
@@ -406,7 +348,7 @@
                                                                     }
                                                                 )
 
-                                                                ;; Handle MSG_DEBUG_LOG (Type 0x06): Tunnel ESP32 ASCII log
+                                                                ;; Log line from the ESP32: print it to the VESC Tool terminal
                                                                 (if (= msg-type MSG-DEBUG-LOG)
                                                                     {
                                                                         (var copy-len (if (> msg-len 120) 120 msg-len))
@@ -425,16 +367,16 @@
                                                                         (bufset-u8 log-str-buf copy-len 0)
                                                                         (puts log-str-buf)
 
-                                                                        ;; Parse Packet Loss Debug Mode toggle
                                                                         (var idx-drop (str-find log-str-buf "E:DropDbg:"))
                                                                         (if (>= idx-drop 0)
                                                                             {
                                                                                 (var mode-char (bufget-u8 log-str-buf (+ idx-drop 10)))
-                                                                                (setq drop-dbg-verbose (= mode-char 49)) ; ASCII '1' == 49
+                                                                                (setq drop-dbg-verbose (= mode-char 49)) ; '1'
                                                                             }
                                                                         )
 
-                                                                        ;; Cache ESP32 Firmware Version broadcast
+                                                                        ;; Store the ESP32 version for (ver). These string functions allocate; acceptable
+                                                                        ;; because version lines are rare, but they should move out of this loop.
                                                                         (var idx-ver (str-find log-str-buf "E:Ver:"))
                                                                         (if (>= idx-ver 0)
                                                                             {
@@ -480,13 +422,13 @@
                                                                 )
                                                             }
                                                             {
-                                                                ;; CRC mismatch: consume single corrupted byte to slide search window
+                                                                ;; Bad CRC: drop one byte and search again
                                                                 (uart-read rx-header 1 0 nil 0)
                                                             }
                                                         )
                                                     }
                                                     {
-                                                        ;; Incomplete frame: consume single corrupted byte to slide search window
+                                                        ;; Incomplete frame: drop one byte and search again
                                                         (uart-read rx-header 1 0 nil 0)
                                                     }
                                                 )
@@ -496,14 +438,13 @@
                                 )
                             }
                             {
-                                ;; First byte was not START-1. If already read a packet this pass, exit loop
+                                ;; Not a start byte: stop if a frame was already read this pass
                                 (if has-read
                                     (setq keep-reading nil)
                                 )
                             }
                         )
                         {
-                            ;; No bytes available in FIFO
                             (setq keep-reading nil)
                         }
                     )
@@ -514,18 +455,15 @@
                 }
             )
 
-            ;; -------------------------------------------------------------
-            ;; Actuation, Smooth Interpolation & Dead-Man Engine
-            ;; -------------------------------------------------------------
+            ;; Motor commands
             (if (or boot-locked kill-pin-low (> live-fault 0))
                 {
                     (cut-motors)
                 }
                 {
-                    ;; Check Comms Dead-Man Timeout (>= 500ms / 25 missed ticks)
+                    ;; Dead-man: no valid frame for 500 ms cuts the motors (the VESC Tool timeout is also 500 ms)
                     (var delta-rx (secs-since last-rx-time))
                     (if (>= delta-rx 0.500)
-                        ;; Dead-man Watchdog Cutoff (>= 500ms): 0.0A freewheel
                         {
                             (cut-motors)
                             (foc-play-stop)
@@ -536,9 +474,9 @@
                                 }
                             )
                         }
-                        ;; Comms Active or Transient Packet Drop (< 500ms): Pure Zero-Order Hold (ZOH)
+                        ;; Under 500 ms: keep using the last throttle, brake and mode
                         {
-                            ;; Track and log packet drop streaks (> 1 missed tick in normal mode, >= 1 in verbose mode)
+                            ;; Log missing frames (one or more in verbose mode, two or more otherwise)
                             (if (> delta-rx 0.025)
                                 {
                                     (var cur-missed-ticks (to-i (floor (/ (- delta-rx 0.005) 0.020))))
@@ -556,8 +494,7 @@
                                 }
                             )
 
-                            ;; Normal actuation with Pure ZOH across active targets (throttle, brake, dual-mode)
-                            ;; Active Brake Priority: Brake unconditionally overrides throttle
+                            ;; Brake wins over throttle
                             (if (> target-brake 0)
                                 {
                                     (setq actual-throt 0)
@@ -569,7 +506,7 @@
                                     (var front-spd-val (if front-vesc-online (canget-speed CAN-ID-FRONT-VESC) 0.0))
                                     (var front-spd-mps (if front-spd-val (abs (to-float front-spd-val)) 0.0))
 
-                                    ;; Evaluate 1.0s Standstill Hill Stop Assist
+                                    ;; Hill hold after 1 s stopped on the brake (both wheels)
                                     (var is-standstill (and (< rear-spd-mps SPEED-STANDSTILL-MPS) (< front-spd-mps SPEED-STANDSTILL-MPS)))
                                     (if is-standstill
                                         {
@@ -587,7 +524,7 @@
                                         }
                                     )
 
-                                    ;; Speed-Scaled Regen Ratio for Rear Wheel
+                                    ;; Regen per wheel: 0 below 5 mph, rising to full at 20 mph (full at any speed during hill hold)
                                     (var effective-brake-rear brake-ratio)
                                     (if (not stop-assist-active)
                                         {
@@ -603,7 +540,6 @@
                                         }
                                     )
 
-                                    ;; Speed-Scaled Regen Ratio for Front Wheel
                                     (var effective-brake-front brake-ratio)
                                     (if (not stop-assist-active)
                                         {
@@ -619,8 +555,9 @@
                                         }
                                     )
 
-                                    ;; Dispatch Passive Braking Commands:
-                                    ;; Command (set-current 0.0) when rear effective brake is 0.0 to prevent latching in brake mode
+                                    ;; With no regen, command 0 current instead of brake mode. In brake mode the VESC applies
+                                    ;; current against the sign of the measured speed; near standstill that sign is noise and
+                                    ;; can drive the wheel forward (seen on the front wheel).
                                     (if (> effective-brake-rear 0.0)
                                         (set-brake-rel effective-brake-rear)
                                         (set-current 0.0)
@@ -634,7 +571,6 @@
                                     (setq current-rear-cmd 0.0)
                                     (setq current-front-cmd 0.0)
 
-                                    ;; Consolidated Change-Only Brake Log (Transition to Brake)
                                     (if (!= last-log-state 2)
                                         {
                                             (setq last-log-state 2)
@@ -643,19 +579,17 @@
                                     )
                                 }
                                 {
-                                    ;; Reset Stop Assist State on Brake Release
                                     (setq stop-assist-active nil)
                                     (setq standstill-start-time 0)
                                     (setq actual-brake 0)
 
-                                    ;; Drive Torque Dispatch
+                                    ;; Drive
                                     (if (> target-throt THROTTLE-NEUTRAL-COUNTS)
                                         {
-                                            ;; Direct Target Tracking with Lost-Packet Shock Absorber
+                                            ;; Follow the throttle directly. The 2000-count step below was meant for a gap over 35 ms,
+                                            ;; but delta-rx is measured after last-rx-time is updated, so it never acts (docs/pitfalls.md).
                                             (if (<= target-throt actual-throt)
-                                                ;; Instant decel roll-off / release (0ms latency)
                                                 (setq actual-throt target-throt)
-                                                ;; Positive acceleration: direct tracking during healthy comms, clamp only after dropped packets
                                                 (if (or (<= delta-rx 0.035) (<= (- target-throt actual-throt) 2000))
                                                     {
                                                         (setq actual-throt target-throt)
@@ -677,13 +611,13 @@
                                             (var rear-throt throt-ratio)
                                             (var front-throt throt-ratio)
 
-                                            ;; VESC Local Per-Motor Speed Limiting (TCS Foundation)
+                                            ;; Speed limit per wheel: drive fades linearly to 0 over the last 3 mph. Done here, not
+                                            ;; on the ESP32, so it keeps working if the ESP32 link fails.
                                             (if (> active-speed-limit 0)
                                                 {
                                                     (var lim-mps (/ (to-float active-speed-limit) 100.0))
                                                     (var taper-start (- lim-mps SPEED-LIMIT-TAPER-MPS))
 
-                                                    ;; Rear Wheel Speed Taper
                                                     (var rear-spd-val (get-speed))
                                                     (var rear-spd (if rear-spd-val (abs (to-float rear-spd-val)) 0.0))
                                                     (if (>= rear-spd lim-mps)
@@ -693,7 +627,6 @@
                                                         )
                                                     )
 
-                                                    ;; Front Wheel Speed Taper
                                                     (var front-spd-val (if front-vesc-online (canget-speed CAN-ID-FRONT-VESC) 0.0))
                                                     (var front-spd (if front-spd-val (abs (to-float front-spd-val)) 0.0))
                                                     (if (>= front-spd lim-mps)
@@ -705,6 +638,7 @@
                                                 }
                                             )
 
+                                            ;; Both motors when dual drive is on and the front is online; otherwise rear only, and the front gets 0 current (not brake mode)
                                             (if (and (= active-dual-mode 1) front-vesc-online)
                                                 {
                                                     (set-current-rel rear-throt COAST-OFF-DELAY-SEC)
@@ -722,7 +656,6 @@
                                                 }
                                             )
 
-                                            ;; Consolidated Change-Only Drive Log (Transition to Drive)
                                             (if (!= last-log-state 1)
                                                 {
                                                     (setq last-log-state 1)
@@ -734,7 +667,8 @@
                                             )
                                         }
                                         {
-                                            ;; Neutral Freewheel (0.0A with Speed-Governed FOC Tracking)
+                                            ;; Throttle released: 0 current. While rolling, keep modulating for the off-delay so the
+                                            ;; next throttle input engages smoothly; the front uses canset-current-rel for the off-delay.
                                             (setq actual-throt 0)
                                             (var rear-rpm-val (get-rpm))
                                             (var rear-rolling (if rear-rpm-val (> (abs (to-float rear-rpm-val)) SPEED-ROLL-THRESH-ERPM) nil))
@@ -776,10 +710,7 @@
                 }
             )
 
-            ;; -------------------------------------------------------------
-            ;; Telemetry TX: Fastest-Wheel Speed Arbitration & Status Frame
-            ;; Dispatches 1:1 in synchronous lockstep with received controls
-            ;; -------------------------------------------------------------
+            ;; Telemetry, every pass: speed of the faster wheel in cm/s and the fault flags
             (var rear-raw (get-speed))
             (var rear-mps (if rear-raw (abs (to-float rear-raw)) 0.0))
             (var front-raw (if front-vesc-online (canget-speed CAN-ID-FRONT-VESC) 0.0))
@@ -795,14 +726,12 @@
             (bufset-i16 tx-payload 2 speed-scaled 'little-endian)
             (var tx-crc (crc16 tx-payload 5))
 
-            ;; Copy payload into tx-telem frame and append CRC16
             (bufcpy tx-telem 2 tx-payload 0 5)
             (bufset-u16 tx-telem 7 tx-crc)
 
-            ;; Transmit 9-byte telemetry frame over UART
             (uart-write tx-telem)
 
-            ;; Elapsed-compensated 50.0 Hz loop pacing with native SI seconds
+            ;; Sleep for the rest of the 20 ms period
             (var elapsed (secs-since t-start))
             (if (< elapsed 0.020)
                 (sleep (- 0.020 elapsed))
@@ -812,10 +741,8 @@
     )
 )
 
-;; =============================================================================
-;; Thread 2: CAN Health Supervisor (10 Hz / 100ms loop)
-;; Evaluates (can-msg-age CAN-ID-FRONT-VESC 1), updates atomic front-vesc-online
-;; =============================================================================
+;; Front VESC watch, every 100 ms. can-msg-age reads the age of the front's last CAN status message
+;; (status 1, sent at the rate set in VESC Tool); after 500 ms it is marked offline.
 (defun thd-can-supervisor ()
     (loopwhile t
         {
@@ -839,15 +766,12 @@
                 }
             )
 
-            (sleep 0.100) ; 10 Hz / 100ms loop
+            (sleep 0.100)
         }
     )
 )
 
 @const-end
 
-;; =============================================================================
-;; Concurrent Process Spawning (2 Green Threads)
-;; =============================================================================
 (spawn thd-powertrain-50hz)
 (spawn thd-can-supervisor)
