@@ -1,33 +1,17 @@
 /**
  * @file VESCUARTBridge.cpp
- * @brief Implementation of the robust serial communication bridge between ESP32 and VESC motor controller.
- * @details Implements CRC16-CCITT packet validation, framing synchronization, keep-alive heartbeat generation,
- *          and a 50ms RX framing timeout watchdog.
- * @date 2026-08-25
+ * @brief Framed serial link to the rear VESC. See VESCUARTBridge.h for the frame format.
  */
 
 #include "VESCUARTBridge.h"
 
 // #define VESC_DBG
 
-/**
- * @brief Constructs a new VESCUARTBridge instance and initializes the hardware serial interface.
- * @param[in] serial_port Pointer to HardwareSerial peripheral (e.g. &Serial1).
- * @param[in] baud_rate Serial baud rate (defaults to 230,400 bps standard).
- * @param[in] rx_pin ESP32 GPIO pin for UART RX. Valid range: 0-39.
- * @param[in] tx_pin ESP32 GPIO pin for UART TX. Valid range: 0-33.
- */
 VESCUARTBridge::VESCUARTBridge(HardwareSerial* serial_port, uint32_t baud_rate, int8_t rx_pin, int8_t tx_pin)
     : _serial(serial_port), _baud_rate(baud_rate), _rx_pin(rx_pin), _tx_pin(tx_pin) {
     _tx_mutex = xSemaphoreCreateMutex();
 }
 
-/**
- * @brief Initializes or reconfigures the hardware serial port (safe to call in setup()).
- * @param[in] baud_rate Serial baud rate (defaults to constructor value if 0).
- * @param[in] rx_pin ESP32 GPIO pin for UART RX (defaults to constructor value if -1).
- * @param[in] tx_pin ESP32 GPIO pin for UART TX (defaults to constructor value if -1).
- */
 void VESCUARTBridge::begin(uint32_t baud_rate, int8_t rx_pin, int8_t tx_pin) {
     if (baud_rate != 0) _baud_rate = baud_rate;
     if (rx_pin != -1) _rx_pin = rx_pin;
@@ -43,10 +27,6 @@ void VESCUARTBridge::begin(uint32_t baud_rate, int8_t rx_pin, int8_t tx_pin) {
     }
 }
 
-/**
- * @brief Destructor that safely cleans up FreeRTOS synchronization mutex.
- * @note Core affinity: Core 1 / Core 0.
- */
 VESCUARTBridge::~VESCUARTBridge() {
     if (_tx_mutex != nullptr) {
         vSemaphoreDelete(_tx_mutex);
@@ -54,10 +34,6 @@ VESCUARTBridge::~VESCUARTBridge() {
     }
 }
 
-/**
- * @brief Registers the callback invoked upon successful decoding and CRC validation of an incoming frame.
- * @param[in] cb Static function pointer of type MessageCallback. Pass nullptr to clear.
- */
 void VESCUARTBridge::set_receive_callback(MessageCallback cb) {
     _on_message = cb;
 
@@ -70,59 +46,41 @@ void VESCUARTBridge::set_receive_callback(MessageCallback cb) {
     #endif
 }
 
-/**
- * @brief Real-time update loop handling RX stream processing, framing watchdogs, and keep-alive heartbeats.
- * @note Enforces 50ms framing watchdog on stalled partial RX frames. Capped at 512 bytes per update.
- * @note Core affinity: Core 1. Zero dynamic memory allocation. Non-blocking.
- */
 void VESCUARTBridge::update() {
-    // Prevent hardware panic if _serial is null
     if (_serial == nullptr) {
         #ifdef VESC_DBG
             static bool null_warned = false;
             if (!null_warned) {
                 Serial.println(F("Esp32:Vesc:ErrNullPortOnUpdate:E7"));
-                null_warned = true; // Prevent spamming the console
+                null_warned = true;
             }
         #endif
 
         return;
     }
 
-    // Framing Watchdog: Purge partial frame if RX stalled for > 50ms
+    // Drop a partial frame after FRAMING_TIMEOUT_MS of silence
     if (_rx_state != WAIT_START_1 && (millis() - _last_rx_byte_time >= FRAMING_TIMEOUT_MS)) {
         _rx_state = WAIT_START_1;
         _rx_index = 0;
     }
 
-    // Process incoming bytes, but cap the limit to prevent Watchdog Starvation from EMI floods
+    // Read at most 512 bytes per call so a burst of noise cannot stall the loop
     uint16_t bytes_processed = 0;
     while (_serial->available() && bytes_processed < 512) {
         process_incoming_byte(static_cast<uint8_t>(_serial->read()));
         bytes_processed++;
     }
 
-    // Enforce the Keep-Alive Heartbeat
-    // Note: millis() rollover is safely handled by the subtraction logic
+    // Keepalive when nothing was sent for _heartbeat_interval_ms (unsigned subtraction handles millis() rollover)
     if (_heartbeat_interval_ms > 0 && (millis() - _last_tx_time >= _heartbeat_interval_ms)) {
         send_heartbeat();
     }
 }
 
-/**
- * @brief Transmits a structured binary message with framing and CRC16-CCITT to the VESC.
- * @param[in] type The MessageType identifier.
- * @param[in] payload Pointer to the binary payload data buffer (may be nullptr if len == 0).
- * @param[in] len Length in bytes of the payload. Valid range: 0 to 255.
- * @return bool True if successfully formatted and written to the UART TX FIFO; false on mutex timeout or invalid arguments.
- * @note Thread-safe across Core 0 and Core 1 via bounded mutex. Zero-copy transmission directly to hardware TX buffer.
- * @see MessageType, calculate_crc16
- */
 bool VESCUARTBridge::send_message(MessageType type, const uint8_t* payload, uint8_t len) {
     if (_serial == nullptr) return false;
 
-    // Fail-fast on malformed payload parameters.
-    // If payload length is non-zero, payload pointer must be valid.
     if (len > 0 && payload == nullptr) {
         #ifdef VESC_DBG
             Serial.printf("Esp32:VescTx:ErrNullPayload:Type:0x%02X:E7\n", static_cast<uint8_t>(type));
@@ -131,24 +89,23 @@ bool VESCUARTBridge::send_message(MessageType type, const uint8_t* payload, uint
         return false;
     }
 
-    // Acquire TX mutex with bounded timeout (10ms) to ensure atomic packet transmission across cores
+    // Wait at most 10 ms for the other core to finish its frame
     if (_tx_mutex != nullptr) {
         if (xSemaphoreTake(_tx_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
-            return false; // Mutex contention timeout
+            return false;
         }
     }
 
-    // Multi-packet wire pacing: enforce >= 2ms inter-frame gap strictly for secondary frames
-    // (MSG_TX_DEBUG_LOG, MSG_TX_AUDIO) and any frame following a secondary frame.
-    // Primary control frames (MSG_TX_CONTROL) stream with sub-50us Core 1 real-time phase lag during healthy operation.
+    // Keep at least 2 ms between a log or audio frame and the frame before and after it.
+    // Control and keepalive frames that follow a control frame are not delayed.
     const bool is_secondary = (type != MSG_TX_CONTROL && type != MSG_TX_HEARTBEAT);
     if (is_secondary || _last_tx_was_secondary) {
         while (micros() - _last_tx_micros < 2000) {
-            // Spin-wait for remaining fraction of 2ms quiet interval
+            // Busy wait, at most 2 ms
         }
     }
 
-    // Calculate CRC over TYPE, LENGTH, and PAYLOAD
+    // CRC over type, length and payload
     uint16_t crc = 0x0000; 
     crc = calculate_crc16(reinterpret_cast<const uint8_t*>(&type), 1, crc); 
     crc = calculate_crc16(reinterpret_cast<const uint8_t*>(&len), 1, crc);
@@ -156,7 +113,6 @@ bool VESCUARTBridge::send_message(MessageType type, const uint8_t* payload, uint
         crc = calculate_crc16(payload, len, crc);
     }
 
-    // Write framing and payload directly to the hardware TX FIFO (Zero-Copy)
     _serial->write(START_BYTE_1);
     _serial->write(START_BYTE_2);
     _serial->write(type);
@@ -166,10 +122,9 @@ bool VESCUARTBridge::send_message(MessageType type, const uint8_t* payload, uint
         _serial->write(payload, len);
     }
     
-    _serial->write(static_cast<uint8_t>(crc >> 8));   // CRC High Byte
-    _serial->write(static_cast<uint8_t>(crc & 0xFF)); // CRC Low Byte
+    _serial->write(static_cast<uint8_t>(crc >> 8));
+    _serial->write(static_cast<uint8_t>(crc & 0xFF));
 
-    // Reset heartbeat timer and high-resolution wire pacing timestamp
     _last_tx_time = millis();
     _last_tx_micros = micros();
     _last_tx_was_secondary = is_secondary;
@@ -180,20 +135,10 @@ bool VESCUARTBridge::send_message(MessageType type, const uint8_t* payload, uint
     return true;
 }
 
-/**
- * @brief Transmits a zero-length keep-alive heartbeat frame (MSG_TX_HEARTBEAT).
- * @note Core affinity: Core 1. Zero dynamic memory allocation. Thread-safe via TX mutex.
- * @see MSG_TX_HEARTBEAT, send_message
- */
 void VESCUARTBridge::send_heartbeat() {
     send_message(MSG_TX_HEARTBEAT, nullptr, 0);
 }
 
-/**
- * @brief Feed a single incoming serial byte into the RX framing state machine.
- * @param[in] incoming_byte Raw byte from UART RX FIFO. Valid range: 0x00 to 0xFF.
- * @note Core affinity: Core 1. Zero dynamic memory allocation.
- */
 void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
     _last_rx_byte_time = millis();
 
@@ -208,10 +153,10 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
             if (incoming_byte == START_BYTE_2) {
                 _rx_state = EXPECT_TYPE;
             } else if (incoming_byte == START_BYTE_1) {
-                // Handle duplicated start bytes (e.g., 0xAA 0xAA 0x55)
+                // 0xAA 0xAA 0x55: the second 0xAA may be the real start
                 _rx_state = WAIT_START_2; 
             } else {
-                _rx_state = WAIT_START_1; // False alarm
+                _rx_state = WAIT_START_1;
             }
             break;
 
@@ -229,7 +174,7 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
 
         case EXPECT_LEN:
             _rx_len = incoming_byte;
-            // Strict type-length plausibility verification
+            // Each known type has a fixed or bounded length; anything else is not a real frame
             if (_rx_type == MSG_TX_HEARTBEAT && _rx_len != 0) {
                 _rx_state = (incoming_byte == START_BYTE_1) ? WAIT_START_2 : WAIT_START_1;
             } else if (_rx_type == MSG_TX_CONTROL && _rx_len != sizeof(TXPayloadControl)) {
@@ -244,10 +189,8 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
                 #ifdef VESC_DBG
                     Serial.println(F("Esp32:VescRx:ErrOverflowDrop:E7"));
                 #endif
-                // Buffer overflow protection: drop packet and reset
                 _rx_state = (incoming_byte == START_BYTE_1) ? WAIT_START_2 : WAIT_START_1;
             } else if (_rx_len == 0) {
-                // Empty payload (like a heartbeat), skip straight to CRC
                 _rx_state = EXPECT_CRC1;
             } else {
                 _rx_index = 0;
@@ -271,7 +214,6 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
             {
                 const uint16_t received_crc = static_cast<uint16_t>((static_cast<uint16_t>(_rx_crc_high) << 8) | incoming_byte);
                 
-                // Extract the raw byte from the enum to guarantee memory safety during CRC calculation
                 const uint8_t raw_type_byte = static_cast<uint8_t>(_rx_type);
                 
                 uint16_t calculated_crc = 0x0000;
@@ -282,7 +224,6 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
                     calculated_crc = calculate_crc16(_rx_buffer, _rx_len, calculated_crc);
                 }
 
-                // If valid, dispatch to the application layer
                 if (calculated_crc == received_crc) {
                     _last_valid_rx_time = millis();
                     #ifdef VESC_DBG
@@ -304,7 +245,8 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
                                       calculated_crc, received_crc, raw_type_byte, _rx_len);
                     }
 
-                    // Sliding-window resynchronization: search buffered frame bytes for next 0xAA 0x55
+                    // The bytes after a false start may hold the next real frame: find 0xAA 0x55 in what was
+                    // received and feed everything from there back through the state machine
                     int16_t next_start_idx = -1;
                     if (raw_type_byte == START_BYTE_1 && _rx_len == START_BYTE_2) {
                         next_start_idx = 0;
@@ -328,7 +270,6 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
                     }
 
                     if (next_start_idx != -1) {
-                        // Replay bytes starting from next start marker
                         uint8_t replay_buf[MAX_PAYLOAD_SIZE + 4];
                         uint16_t total_bytes = 0;
                         replay_buf[total_bytes++] = raw_type_byte;
@@ -353,13 +294,6 @@ void VESCUARTBridge::process_incoming_byte(uint8_t incoming_byte) {
     }
 }
 
-/**
- * @brief Standard CRC16-CCITT (Polynomial 0x1021) across segmented buffers.
- * @param[in] data Pointer to input data chunk.
- * @param[in] len Number of bytes in this chunk.
- * @param[in] current_crc Running CRC accumulator from previous segments.
- * @return uint16_t Updated running CRC16 checksum.
- */
 uint16_t VESCUARTBridge::calculate_crc16(const uint8_t *data, uint16_t len, uint16_t current_crc) {
     if (data == nullptr) {
         return current_crc; 
@@ -379,30 +313,15 @@ uint16_t VESCUARTBridge::calculate_crc16(const uint8_t *data, uint16_t len, uint
     return crc;
 }
 
-/**
- * @brief Wrapper for single-pass CRC16-CCITT calculation.
- * @param[in] data Pointer to input data buffer.
- * @param[in] len Number of bytes to process.
- * @return uint16_t Computed CRC16 checksum.
- */
 uint16_t VESCUARTBridge::calculate_crc16(const uint8_t *data, uint16_t len) {
     return calculate_crc16(data, len, 0x0000);
 }
 
-/**
- * @brief Checks if valid telemetry packets have been received from VESC within the specified timeout.
- * @param[in] timeout_ms Maximum allowable silence threshold in ms (default 100ms = 5 frames at 50Hz).
- * @return bool True if connection is alive and healthy; false if timed out or not yet received.
- */
 bool VESCUARTBridge::is_connected(uint32_t timeout_ms) const {
     if (_last_valid_rx_time == 0) return false;
     return (millis() - _last_valid_rx_time) <= timeout_ms;
 }
 
-/**
- * @brief Returns the timestamp in milliseconds of the last successfully decoded, CRC-verified packet.
- * @return uint32_t Millis timestamp of last valid frame.
- */
 uint32_t VESCUARTBridge::get_last_valid_rx_ms() const {
     return _last_valid_rx_time;
 }

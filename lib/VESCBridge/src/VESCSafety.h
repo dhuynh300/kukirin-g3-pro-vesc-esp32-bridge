@@ -1,22 +1,10 @@
-//! KNOWN PITFALLS & FAILURE MODES:
-//! - P01 [VESC UART Baud Rate]: Must strictly operate at 230,400 bps. 115,200 bps causes framing corruption and link loss.
-//! - P02 [Hardware Killswitch Level]: GPIO 2 connects to VESC ADC2 (KILL_SW_MODE_ADC2_LOW). LOW (<1.65V) = killed/fail-closed, HIGH (>1.65V) = armed.
-//! - P03 [Automotive Brake-to-Start]: B2S requires brake held >= 200ms with neutral throttle (<100 counts) and vehicle stationary (<0.6 mph / <300 ERPM).
-//! - P04 [Active Brake Priority]: Brake actuation must unconditionally override and zero throttle with 0ms phase lag.
-//! - P05 [Throttle Hysteresis & Plausibility]: Throttle ADC values >1050 counts indicate rail short/hardware fault. Schmitt trigger prevents jitter at deadband.
-//! - P06 [Zero-Throttle Lockout]: Drivetrain will not engage if booted or recovered with throttle open (Whiskey-Throttle Lockout).
-//! - P07 [Transient Fault Recovery]: Comm/FOC faults cut torque without dropping physical killswitch; recovery requires neutral throttle in traffic.
-//! - P08 [CAN Desync & Single-Motor Limp]: On front CAN loss (>100ms), master asserts E-017 and grants 100% rear power authority governed by rider gear.
-//! - P09 [Passive Braking Mandate]: Electronic braking strictly commands CONTROL_MODE_CURRENT_BRAKE (0.0A at 0 RPM); CONTROL_MODE_HANDBRAKE is forbidden.
-//! - P10 [Dead-man Watchdog]: 5 missed frames (100ms) trips failsafe: Ticks 1-4 Zero-Order Hold (ZOH), Tick 5 cuts torque to 0.0A freewheel.
-
 #pragma once
 
 #include <Arduino.h>
 #include <math.h>
 #include "VESCUARTBridge.h"
 
-// Canonical fast unit and time conversion macros
+// Unit conversion macros
 #ifndef MS_TO_SEC
 #define MS_TO_SEC(ms)        ((ms) * 0.001f)
 #endif
@@ -49,54 +37,54 @@ namespace VESCBridge {
 
 /**
  * @enum ArmingState
- * @brief Automotive powertrain arming lifecycle state.
+ * @brief Whether the rider has armed the drivetrain with brake-to-start.
  */
 enum class ArmingState : uint8_t {
-    BootUnarmed  = 0, /**< @brief Booted safely or tripped; power stage de-energized (GPIO 2 LOW). */
-    ReadyToDrive = 1  /**< @brief Armed after rider holds brake >= 200ms with neutral throttle (GPIO 2 HIGH). */
+    BootUnarmed  = 0, /**< @brief After boot or disarm(): killswitch output low, no drive. */
+    ReadyToDrive = 1  /**< @brief Armed by brake-to-start: killswitch output high. */
 };
 
 /**
  * @enum SafetyFault
- * @brief Drivetrain supervisory fault classification.
+ * @brief Condition shown to the rider as a display error code (mapping in src/main.cpp).
  */
 enum class SafetyFault : uint8_t {
-    None                   = 0, /**< @brief Normal operation. */
-    KillswitchDisarmed     = 1, /**< @brief Hardware killswitch open / disarmed or brake release launch lockout. */
-    VescOffline            = 2, /**< @brief VESC UART telemetry link lost. */
-    CanDesync              = 3, /**< @brief Front VESC CAN link timeout >500ms. */
-    FocFaultLockout        = 4, /**< @brief VESC FOC fault active or awaiting neutral reset. */
-    CommsRecoveryLockout   = 5, /**< @brief Comm recovery neutral lockout active. */
-    DisplayStalled         = 6  /**< @brief Display comms watchdog expired. */
+    None                   = 0, /**< @brief No fault. */
+    KillswitchDisarmed     = 1, /**< @brief Not armed, or the brake was released with the throttle open. */
+    VescOffline            = 2, /**< @brief No telemetry from the rear VESC for VESC_COMMS_TIMEOUT_MS. */
+    CanDesync              = 3, /**< @brief Front VESC lost (the script saw no CAN status for 500 ms). */
+    FocFaultLockout        = 4, /**< @brief Rear VESC fault active, or cleared and waiting for neutral throttle. */
+    CommsRecoveryLockout   = 5, /**< @brief VESC link came back; waiting for neutral throttle. */
+    DisplayStalled         = 6  /**< @brief Display frames stopped, or came back and waiting for neutral throttle. */
 };
 
 /**
  * @namespace PowertrainConfig
- * @brief Authoritative engineering constants and powertrain parameters (120A system).
- *        Derived mathematically via constexpr from master sources of truth.
+ * @brief Firmware constants for the drivetrain. Values that vesc/main.lbm also defines are checked by
+ *        tools/check_shared_constants.py; edit both files together.
  */
 namespace PowertrainConfig {
-    // Drivetrain Geometry Constants
-    static constexpr float WHEEL_DIAMETER_INCHES        = 10.0f;                                      /**< Nominal wheel outer diameter (inches). */
-    static constexpr uint8_t MOTOR_POLE_PAIRS           = 15;                                         /**< BLDC motor magnet pole pairs. */
-    static constexpr float METERS_PER_INCH              = 0.0254f;                                    /**< Standard metric inch conversion factor. */
-    static constexpr float PI_CONST                     = 3.14159265358979323846f;                    /**< Canonical Pi. */
-    static constexpr float WHEEL_DIAMETER_METERS        = WHEEL_DIAMETER_INCHES * METERS_PER_INCH;     /**< Wheel diameter in meters (0.254m). */
-    static constexpr float WHEEL_CIRCUMFERENCE_METERS   = WHEEL_DIAMETER_METERS * PI_CONST;           /**< Wheel rolling circumference (0.79796m). */
+    // Wheel and motor
+    static constexpr float WHEEL_DIAMETER_INCHES        = 10.0f;                                      /**< Nominal wheel diameter. */
+    static constexpr uint8_t MOTOR_POLE_PAIRS           = 15;                                         /**< Hub motor pole pairs (30 magnets). */
+    static constexpr float METERS_PER_INCH              = 0.0254f;                                    /**< m per inch. */
+    static constexpr float PI_CONST                     = 3.14159265358979323846f;                    /**< Pi. */
+    static constexpr float WHEEL_DIAMETER_METERS        = WHEEL_DIAMETER_INCHES * METERS_PER_INCH;     /**< 0.254 m. */
+    static constexpr float WHEEL_CIRCUMFERENCE_METERS   = WHEEL_DIAMETER_METERS * PI_CONST;           /**< 0.798 m. */
 
-    // Velocity & Speed Governing Thresholds
-    static constexpr float MPS_PER_MPH                  = 0.44704f;                                   /**< Canonical mph to m/s conversion factor. */
-    static constexpr float SPEED_STATIONARY_MPH         = 0.6f;                                       /**< Maximum speed to qualify stationary vehicle for B2S arming. */
-    static constexpr float SPEED_STATIONARY_MPS         = SPEED_STATIONARY_MPH * MPS_PER_MPH;         /**< Stationary threshold in m/s (0.268224 m/s). */
-    static constexpr float SPEED_STATIONARY_CMS         = SPEED_STATIONARY_MPS * 100.0f;              /**< Stationary threshold in cm/s (26.8224 cm/s). */
-    static constexpr uint32_t SPEED_STATIONARY_ERPM     = 300;                                        /**< Maximum motor electrical RPM to qualify stationary vehicle. */
-    static constexpr float MODE_1_SPEED_LIMIT_MPH       = 15.0f;                                      /**< Mode 1 (Eco) maximum speed ceiling (15.0 mph). */
-    static constexpr float MODE_2_SPEED_LIMIT_MPH       = 28.0f;                                      /**< Mode 2 (Std) maximum speed ceiling (28.0 mph). */
-    static constexpr float SPEED_LIMIT_TAPER_WINDOW_MPH = 3.0f;                                       /**< Cubic Hermite smoothstep feathering window (3.0 mph). */
-    static constexpr uint16_t MODE_1_SPEED_LIMIT_CMS    = 671;                                        /**< Mode 1 speed limit in cm/s (15.0 mph * 44.704). */
-    static constexpr uint16_t MODE_2_SPEED_LIMIT_CMS    = 1252;                                       /**< Mode 2 speed limit in cm/s (28.0 mph * 44.704). */
-    static constexpr uint16_t MODE_3_SPEED_LIMIT_CMS    = 0;                                          /**< Mode 3 speed limit in cm/s (0 = Unlimited). */
-    static constexpr uint16_t SPEED_LIMIT_TAPER_CMS     = 134;                                        /**< Speed limit taper feathering window in cm/s (3.0 mph). */
+    // Speeds
+    static constexpr float MPS_PER_MPH                  = 0.44704f;                                   /**< m/s per mph. */
+    static constexpr float SPEED_STATIONARY_MPH         = 0.6f;                                       /**< Below this speed the vehicle counts as stationary (brake-to-start, arming). */
+    static constexpr float SPEED_STATIONARY_MPS         = SPEED_STATIONARY_MPH * MPS_PER_MPH;         /**< Same, in m/s. */
+    static constexpr float SPEED_STATIONARY_CMS         = SPEED_STATIONARY_MPS * 100.0f;              /**< Same, in cm/s. */
+    static constexpr uint32_t SPEED_STATIONARY_ERPM     = 300;                                        /**< Same check on motor ERPM (about 0.6 mph with 15 pole pairs and a 10 in wheel). */
+    static constexpr float MODE_1_SPEED_LIMIT_MPH       = 15.0f;                                      /**< Mode 1 speed limit. */
+    static constexpr float MODE_2_SPEED_LIMIT_MPH       = 28.0f;                                      /**< Mode 2 speed limit. Mode 3 has none. */
+    static constexpr float SPEED_LIMIT_TAPER_WINDOW_MPH = 3.0f;                                       /**< Drive current fades to zero over this window below the mode limit (applied by the VESC script). */
+    static constexpr uint16_t MODE_1_SPEED_LIMIT_CMS    = 671;                                        /**< Mode 1 limit sent to the VESC, cm/s. */
+    static constexpr uint16_t MODE_2_SPEED_LIMIT_CMS    = 1252;                                       /**< Mode 2 limit sent to the VESC, cm/s. */
+    static constexpr uint16_t MODE_3_SPEED_LIMIT_CMS    = 0;                                          /**< 0 = no limit. */
+    static constexpr uint16_t SPEED_LIMIT_TAPER_CMS     = 134;                                        /**< Taper window in cm/s. */
 
     static constexpr uint16_t get_mode_speed_limit_cms(uint8_t gear) {
         if (gear == 1) return MODE_1_SPEED_LIMIT_CMS;
@@ -104,57 +92,58 @@ namespace PowertrainConfig {
         return MODE_3_SPEED_LIMIT_CMS;
     }
 
-    // Phase Current & Throttle Calibration Envelopes
-    static constexpr float MOTOR_MAX_CURRENT_AMPS       = 120.0f;                                     /**< Phase current ceiling per motor (120A peak). */
-    static constexpr uint16_t THROTTLE_SCALE_MAX_COUNTS = 10000;                                      /**< Normalized throttle request full-scale (0..10000 counts). */
-    static constexpr float CURRENT_COUNTS_PER_AMP       = static_cast<float>(THROTTLE_SCALE_MAX_COUNTS) / MOTOR_MAX_CURRENT_AMPS; /**< 83.333 counts/A scaling factor. */
-    static constexpr float MODE_1_SCALE_RATIO           = 0.50f;                                      /**< Mode 1 torque ceiling ratio (50%). */
-    static constexpr float MODE_2_SCALE_RATIO           = 0.75f;                                      /**< Mode 2 torque ceiling ratio (75%). */
-    static constexpr float MODE_3_SCALE_RATIO           = 1.00f;                                      /**< Mode 3 torque ceiling ratio (100%). */
-    static constexpr uint16_t MODE_1_MAX_COUNTS         = 5000;                                       /**< Mode 1 (Eco): 5000 counts / 60A per motor. */
-    static constexpr uint16_t MODE_2_MAX_COUNTS         = 7500;                                       /**< Mode 2 (Std): 7500 counts / 90A per motor. */
-    static constexpr uint16_t MODE_3_MAX_COUNTS         = 10000;                                      /**< Mode 3 (Turbo): 10000 counts / 120A per motor. */
-    static constexpr uint16_t THROTTLE_NEUTRAL_COUNTS   = 100;                                        /**< 1.0% neutral throttle deadband (100 counts / 1.2A). */
-    static constexpr uint16_t THROTTLE_DEADBAND_COUNTS  = 50;                                         /**< 50 counts (0.5% / 0.60A) hysteresis window to suppress coil hiss. */
-    static constexpr uint16_t PLAUSIBILITY_CLAMP_MAX     = 1050;                                       /**< Throttle ADC plausibility clamp threshold (accommodates 5V/3.3V rail ripple). */
+    // Throttle scale. The script sends current as a fraction of the motor current limit set in VESC Tool
+    // (set-current-rel), so 10000 counts means that limit. MOTOR_MAX_CURRENT_AMPS must match it.
+    static constexpr float MOTOR_MAX_CURRENT_AMPS       = 120.0f;                                     /**< Motor current limit configured in VESC Tool, per motor. */
+    static constexpr uint16_t THROTTLE_SCALE_MAX_COUNTS = 10000;                                      /**< Full-scale throttle and brake command. */
+    static constexpr float CURRENT_COUNTS_PER_AMP       = static_cast<float>(THROTTLE_SCALE_MAX_COUNTS) / MOTOR_MAX_CURRENT_AMPS; /**< 83.3 counts per A. */
+    static constexpr float MODE_1_SCALE_RATIO           = 0.50f;                                      /**< Mode 1: 50 % of full current. */
+    static constexpr float MODE_2_SCALE_RATIO           = 0.75f;                                      /**< Mode 2: 75 %. */
+    static constexpr float MODE_3_SCALE_RATIO           = 1.00f;                                      /**< Mode 3: 100 %. */
+    static constexpr uint16_t MODE_1_MAX_COUNTS         = 5000;                                       /**< Mode 1 ceiling: 60 A per motor. */
+    static constexpr uint16_t MODE_2_MAX_COUNTS         = 7500;                                       /**< Mode 2 ceiling: 90 A per motor. */
+    static constexpr uint16_t MODE_3_MAX_COUNTS         = 10000;                                      /**< Mode 3 ceiling: 120 A per motor. */
+    static constexpr uint16_t THROTTLE_NEUTRAL_COUNTS   = 100;                                        /**< Throttle below 1 % counts as released: needed to arm and to clear lockouts; the script freewheels below it. */
+    static constexpr uint16_t THROTTLE_DEADBAND_COUNTS  = 50;                                         /**< The command sent to the VESC changes only when it moves by at least this much, so small throttle jitter while holding speed does not reach the motor. */
+    static constexpr uint16_t PLAUSIBILITY_CLAMP_MAX     = 1050;                                       /**< Raw throttle above this (full scale is 1000) is treated as a wiring fault and gives zero throttle. */
 
-    // Speed-Scaled Dynamic Electronic Regen Thresholds
-    static constexpr float SPEED_REGEN_MIN_MPH          = 5.0f;                                       /**< Speed below which electronic regen clamps to 0.0 (user-tested). */
-    static constexpr float SPEED_REGEN_MAX_MPH          = 20.0f;                                      /**< Speed above which electronic regen grants 100% PB strength. */
-    static constexpr float SPEED_REGEN_MIN_MPS          = SPEED_REGEN_MIN_MPH * MPS_PER_MPH;          /**< Minimum regen speed in m/s (2.2352 m/s). */
-    static constexpr float SPEED_REGEN_MAX_MPS          = SPEED_REGEN_MAX_MPH * MPS_PER_MPH;          /**< Full regen speed in m/s (8.9408 m/s). */
-    static constexpr float REGEN_LERP_RANGE_MPS         = SPEED_REGEN_MAX_MPS - SPEED_REGEN_MIN_MPS;  /**< Regen taper range in m/s (6.7056 m/s). */
-    static constexpr float INV_REGEN_RANGE_MPS          = 1.0f / REGEN_LERP_RANGE_MPS;                /**< Inverse regen range (0.149129 1/(m/s)). */
+    // Regen fades in with speed (applied per wheel by the VESC script)
+    static constexpr float SPEED_REGEN_MIN_MPH          = 5.0f;                                       /**< No regen below this speed; set from ride testing. */
+    static constexpr float SPEED_REGEN_MAX_MPH          = 20.0f;                                      /**< Full regen (the selected PB level) above this speed. */
+    static constexpr float SPEED_REGEN_MIN_MPS          = SPEED_REGEN_MIN_MPH * MPS_PER_MPH;          /**< m/s. */
+    static constexpr float SPEED_REGEN_MAX_MPS          = SPEED_REGEN_MAX_MPH * MPS_PER_MPH;          /**< m/s. */
+    static constexpr float REGEN_LERP_RANGE_MPS         = SPEED_REGEN_MAX_MPS - SPEED_REGEN_MIN_MPS;  /**< m/s. */
+    static constexpr float INV_REGEN_RANGE_MPS          = 1.0f / REGEN_LERP_RANGE_MPS;                /**< 1 / range, in s/m. */
 
-    // Fail-Safe Watchdogs & Control Loop Timing
-    static constexpr uint32_t CONTROL_LOOP_RATE_HZ      = 50;                                         /**< Real-time control loop frequency (50 Hz). */
-    static constexpr uint32_t VESC_TICK_RATE_HZ         = 50;                                         /**< VESC ping-pong dispatch frequency (50 Hz). */
-    static constexpr uint32_t VESC_TICK_INTERVAL_MS     = 20;                                         /**< Inter-tick period in milliseconds (20ms). */
-    static constexpr float VESC_TICK_INTERVAL_SEC       = 0.020f;                                     /**< Inter-tick period in seconds (0.020s). */
-    static constexpr uint32_t DEADMAN_MISSED_TICKS      = 25;                                         /**< Missed telemetry frames before deadman freewheel trip (25 ticks = 500ms). */
-    static constexpr uint32_t VESC_DROP_SINGLE_MS       = 32;                                         /**< Telemetry silence threshold indicating single dropped 20ms frame (32ms). */
-    static constexpr uint32_t VESC_DROP_STREAK_MS       = 65;                                         /**< Telemetry silence threshold indicating >= 2 consecutive dropped 20ms frames (65ms). */
-    static constexpr uint32_t DISPLAY_DROP_SINGLE_MS    = 180;                                        /**< Display UART silence threshold indicating single dropped ~125ms frame (180ms). */
-    static constexpr uint32_t DISPLAY_DROP_STREAK_MS    = 320;                                        /**< Display UART silence threshold indicating >= 2 consecutive dropped ~125ms frames (320ms). */
-    static constexpr uint32_t VESC_DEADMAN_TIMEOUT_MS   = 500;                                        /**< VESC dead-man failsafe timeout (500ms / 25 ticks). */
-    static constexpr uint32_t VESC_COMMS_TIMEOUT_MS     = 500;                                        /**< VESC UART comms loss fault threshold (500ms / 25 ticks). */
-    static constexpr uint32_t DISPLAY_DEADMAN_TIMEOUT_MS= 500;                                        /**< Display dead-man comms stall timeout (500ms). */
-    static constexpr uint32_t FAULT_CYCLE_PERIOD_MS     = 1000;                                       /**< Multi-fault time-sliced rotation period (1000ms). */
-    static constexpr uint32_t B2S_HOLD_REQUIRED_MS      = 200;                                        /**< Brake-to-Start hold duration requirement (200ms). */
+    // Timing. All link-loss timeouts are 500 ms, matching the timeout set in VESC Tool on both VESCs.
+    static constexpr uint32_t CONTROL_LOOP_RATE_HZ      = 50;                                         /**< Control frames per second to the VESC. */
+    static constexpr uint32_t VESC_TICK_RATE_HZ         = 50;                                         /**< Same as CONTROL_LOOP_RATE_HZ. */
+    static constexpr uint32_t VESC_TICK_INTERVAL_MS     = 20;                                         /**< Control frame period. */
+    static constexpr float VESC_TICK_INTERVAL_SEC       = 0.020f;                                     /**< Same, in s. */
+    static constexpr uint32_t DEADMAN_MISSED_TICKS      = 25;                                         /**< VESC_DEADMAN_TIMEOUT_MS in control periods. */
+    static constexpr uint32_t VESC_DROP_SINGLE_MS       = 32;                                         /**< Telemetry gap logged as one lost frame (verbose logging only). */
+    static constexpr uint32_t VESC_DROP_STREAK_MS       = 65;                                         /**< Telemetry gap logged as two or more lost frames. */
+    static constexpr uint32_t DISPLAY_DROP_SINGLE_MS    = 180;                                        /**< Display gap logged as one lost frame (frames arrive about every 125 ms). */
+    static constexpr uint32_t DISPLAY_DROP_STREAK_MS    = 320;                                        /**< Display gap logged as two or more lost frames. */
+    static constexpr uint32_t VESC_DEADMAN_TIMEOUT_MS   = 500;                                        /**< The script cuts motor current when no control frame arrives for this long (same value in vesc/main.lbm). */
+    static constexpr uint32_t VESC_COMMS_TIMEOUT_MS     = 500;                                        /**< The ESP32 treats the VESC as offline after this long without telemetry. */
+    static constexpr uint32_t DISPLAY_DEADMAN_TIMEOUT_MS= 500;                                        /**< Display stall timeout (the display library uses its own default of the same value). */
+    static constexpr uint32_t FAULT_CYCLE_PERIOD_MS     = 1000;                                       /**< With two faults active, the display alternates between them at this period. */
+    static constexpr uint32_t B2S_HOLD_REQUIRED_MS      = 200;                                        /**< Brake hold time needed to arm. */
 
-    // Acceleration slew & governor parameters
-    static constexpr float SLEW_COUNTS_PER_SEC_PER_PA   = 20000.0f;                                   /**< 20,000 counts/s per PA level. */
-    static constexpr uint8_t DEFAULT_PA_LEVEL           = 3;                                          /**< Standard PA level (60k counts/s, 1200 counts/tick). */
-    static constexpr uint8_t PB_REGEN_MAX_LEVEL         = 5;                                          /**< Maximum P-menu PB regen level. */
-    static constexpr uint16_t REGEN_COUNTS_PER_LEVEL    = 2000;                                       /**< 2000 counts per level (0..10000). */
-    static constexpr float GOVERNOR_RAMP_UP_RATE        = 1.0f;                                       /**< Re-engagement rate limit: 1.0 unit/s ramp-up on speed dips. */
+    // Throttle rise rate (P-menu PA) and regen strength (P-menu PB)
+    static constexpr float SLEW_COUNTS_PER_SEC_PER_PA   = 20000.0f;                                   /**< Throttle may rise this fast per PA level (PA 1..5). Release is instant. */
+    static constexpr uint8_t DEFAULT_PA_LEVEL           = 3;                                          /**< PA level used until the display reports one: 60,000 counts/s. */
+    static constexpr uint8_t PB_REGEN_MAX_LEVEL         = 5;                                          /**< Highest PB level. */
+    static constexpr uint16_t REGEN_COUNTS_PER_LEVEL    = 2000;                                       /**< Brake command per PB level. */
+    static constexpr float GOVERNOR_RAMP_UP_RATE        = 1.0f;                                       /**< Rise rate of the ESP32 speed governor scale, per s (governor inactive, see compute_speed_governor_scale). */
 
-    // Delta time bounding for torque slew rate limiter
-    static constexpr float MIN_SLEW_DT_SEC              = 0.001f;                                     /**< Minimum delta time clamp for slew limiter (1ms). */
-    static constexpr float MAX_SLEW_DT_SEC              = 0.100f;                                     /**< Maximum delta time clamp for slew limiter (100ms). */
-    static constexpr float THROTTLE_SNAP_EPSILON        = 1.0f;                                       /**< Boundary snapping threshold within 1 count. */
+    // Bounds on the time step used by the throttle rise limiter
+    static constexpr float MIN_SLEW_DT_SEC              = 0.001f;                                     /**< s. */
+    static constexpr float MAX_SLEW_DT_SEC              = 0.100f;                                     /**< s; a longer gap cannot release a large step at once. */
+    static constexpr float THROTTLE_SNAP_EPSILON        = 1.0f;                                       /**< Snap to the target when within 1 count. */
 
-    // Canonical Powertrain & Velocity Helpers
+    // Helpers
     inline constexpr float cms_to_mph(int16_t cms) {
         return static_cast<float>(cms) * (0.01f * 2.23693629f);
     }
@@ -175,7 +164,7 @@ namespace PowertrainConfig {
                (gear == 2) ? MODE_2_MAX_COUNTS : MODE_3_MAX_COUNTS;
     }
 
-    // Backward compatibility aliases
+    // Older names
     static constexpr float MAX_MOTOR_CURRENT_A          = MOTOR_MAX_CURRENT_AMPS;
     static constexpr float THROTTLE_FULL_SCALE          = static_cast<float>(THROTTLE_SCALE_MAX_COUNTS);
     static constexpr float COUNTS_PER_AMP               = CURRENT_COUNTS_PER_AMP;
@@ -187,10 +176,8 @@ namespace PowertrainConfig {
 
 /**
  * @struct SlewConfig
- * @brief Compile-time parameterized torque slew rate calculation engine.
- *        Calculates maximum allowed slew rate based on rider P-menu PA acceleration setting (1..5):
- *        Slew Rate = pa_level * 20,000 counts/s (400 to 2,000 counts/tick at 50 Hz).
- *        Eliminates runtime divisions and complex tables.
+ * @brief Throttle rise rate from the P-menu PA setting: PA x 20,000 counts/s, PA clamped to 1..5
+ *        (400 to 2,000 counts per 20 ms).
  */
 struct SlewConfig {
     static constexpr float get_units_per_sec(uint8_t pa_level) {
@@ -206,14 +193,18 @@ struct SlewConfig {
 
 /**
  * @class VESCSafetySupervisor
- * @brief Canonical safety supervisor enforcing fail-closed vehicle interlocks:
- *        - Hardware Killswitch (GPIO 2): Fail-closed LOW (0.0V) on boot/stall/fault, HIGH (3.3V) when armed.
- *        - Automotive Brake-to-Start (Ready-to-Drive): Requires brake hold >= 200ms with throttle neutral (< 2%).
- *        - Zero-Throttle Re-Arm & Boot Lockout: Re-arming or driving rejected if throttle >= 2%.
- *        - Active Brake Priority: Brake pull unconditionally zeroes drive torque.
- *        - CAN Desync Recovery Lockout: Front link recovery requires neutral throttle before re-engaging torque.
- *        - Slew Rate Limiting: Enforces PA-governed acceleration slew rate (20k..100k counts/s).
- * @note Core affinity: Core 1. Zero dynamic memory allocation.
+ * @brief Decides what throttle the ESP32 may send to the VESC.
+ *
+ * - Killswitch output (GPIO 2, wired to the rear VESC's ADC2 input): low at boot and whenever unarmed, so the
+ *   script keeps the motors off even if the ESP32 sends throttle. High only after brake-to-start.
+ * - Brake-to-start: brake held for B2S_HOLD_REQUIRED_MS with the throttle released and the vehicle stationary.
+ * - Brake wins: any brake input zeroes throttle. Releasing the brake with the throttle open keeps throttle at
+ *   zero until the throttle is released.
+ * - Recovery lockouts: after a VESC fault, a lost VESC link, a stalled display, or the front VESC coming back,
+ *   drive stays at zero until the cause is gone and the throttle is released. The killswitch stays high, so the
+ *   rider does not have to stop in traffic.
+ * - Throttle rise is rate-limited by the PA setting; release is instant.
+ * No heap allocation. Called from the main loop only.
  */
 class VESCSafetySupervisor {
 public:
@@ -229,9 +220,7 @@ public:
           _b2s_hold_ms(b2s_hold_ms),
           _max_slew_per_sec(max_slew_per_sec) {}
 
-    /**
-     * @brief Initializes GPIO 2 to output and forces fail-closed LOW (0.0V).
-     */
+    /** @brief Sets the killswitch pin as an output, low, and resets all state. */
     void begin() {
         if (_killswitch_pin >= 0) {
             digitalWrite(_killswitch_pin, LOW);
@@ -253,9 +242,7 @@ public:
         _governor_scale = 1.0f;
     }
 
-    /**
-     * @brief Immediately de-energizes the powertrain (GPIO 2 LOW, throttle clamped to 0).
-     */
+    /** @brief Drops the killswitch output low and returns to the unarmed state (brake-to-start needed again). */
     void disarm() {
         _arming_state = ArmingState::BootUnarmed;
         if (_killswitch_pin >= 0) {
@@ -273,13 +260,14 @@ public:
     }
 
     /**
-     * @brief Non-blocking Brake-to-Start (Ready-to-Drive) update.
-     * @param[in] brake_active True if mechanical/electrical brake lever is actuated.
-     * @param[in] throttle_req Normalized throttle request (0..10000).
-     * @param[in] now_ms Current timestamp in milliseconds.
-     * @param[in] speed_mph Current vehicle speed in mph (must be stationary < 0.6 mph to arm).
-     * @param[in] erpm Current motor electrical RPM (must be stationary < 300 ERPM to arm).
-     * @return bool True if transitioned to ReadyToDrive on this call or currently armed.
+     * @brief Brake-to-start. Arms once the brake has been held for the hold time with the throttle below
+     *        THROTTLE_NEUTRAL_COUNTS and the vehicle stationary. Drives the killswitch output every call.
+     * @param[in] brake_active Brake lever pulled.
+     * @param[in] throttle_req Throttle request, 0..10000.
+     * @param[in] now_ms millis().
+     * @param[in] speed_mph Vehicle speed.
+     * @param[in] erpm Motor ERPM.
+     * @return True if armed.
      */
     bool update_b2s(bool brake_active, uint16_t throttle_req, uint32_t now_ms, float speed_mph = 0.0f, float erpm = 0.0f) {
         if (_arming_state == ArmingState::ReadyToDrive) {
@@ -289,12 +277,11 @@ public:
             return true;
         }
 
-        // Fail-closed while unarmed
+        // Unarmed: keep the VESC killswitch input low
         if (_killswitch_pin >= 0) {
             digitalWrite(_killswitch_pin, LOW);
         }
 
-        // Require brake held, throttle neutral (< 100 counts), and vehicle stationary (< 0.6 mph / < 300 ERPM)
         const bool stationary = (fabsf(speed_mph) < PowertrainConfig::SPEED_STATIONARY_MPH) &&
                                 (fabsf(erpm) < static_cast<float>(PowertrainConfig::SPEED_STATIONARY_ERPM));
 
@@ -311,7 +298,7 @@ public:
                 return true;
             }
         } else {
-            // Reset timer if brake released, throttle out of neutral, or vehicle moving
+            // Any condition missing: restart the hold timer
             _brake_hold_start_ms = now_ms;
         }
 
@@ -319,9 +306,7 @@ public:
         return false;
     }
 
-    /**
-     * @brief Checks if powertrain is in ReadyToDrive state directly synced with physical killswitch GPIO.
-     */
+    /** @brief True if armed. Reads the killswitch pin back when one is configured. */
     bool is_armed() const {
         if (_killswitch_pin >= 0) {
             return (digitalRead(_killswitch_pin) == HIGH);
@@ -329,23 +314,17 @@ public:
         return _arming_state == ArmingState::ReadyToDrive;
     }
 
-    /**
-     * @brief Returns current arming state enum.
-     */
+    /** @brief Current arming state. */
     ArmingState get_arming_state() const {
         return _arming_state;
     }
 
-    /**
-     * @brief Returns current ramped throttle value (0..10000).
-     */
+    /** @brief Throttle after the rise limiter, 0..10000. */
     float get_ramped_throttle() const {
         return _ramped_throttle;
     }
 
-    /**
-     * @brief Updates CAN desync status. On falling edge of desync (reconnection), latches dual-mode recovery neutral lockout.
-     */
+    /** @brief Front VESC status from telemetry. When it comes back, dual drive waits for released throttle. */
     void set_can_desync(bool desync) {
         if (!desync && _last_can_desync) {
             _can_recovery_locked = true;
@@ -353,16 +332,12 @@ public:
         _last_can_desync = desync;
     }
 
-    /**
-     * @brief Returns true if CAN recovery neutral lock is currently holding drive torque off.
-     */
+    /** @brief True while dual drive waits for released throttle after the front VESC came back. */
     bool is_can_recovery_locked() const {
         return _can_recovery_locked;
     }
 
-    /**
-     * @brief Confirms throttle neutral to release CAN recovery lockout.
-     */
+    /** @brief Clears the front VESC recovery lock once the throttle is released. */
     void update_can_recovery(uint16_t throttle_req) {
         if (_can_recovery_locked && throttle_req < PowertrainConfig::THROTTLE_NEUTRAL_COUNTS) {
             _can_recovery_locked = false;
@@ -370,9 +345,8 @@ public:
     }
 
     /**
-     * @brief Updates transient VESC FOC fault status.
-     *        Does NOT trip hardware killswitch (GPIO 2 remains HIGH).
-     *        Locks torque until fault clears AND rider returns throttle to neutral (< 1%).
+     * @brief Rear VESC fault code from telemetry (0 = none). A fault zeroes drive until it clears and the
+     *        throttle is released. The killswitch output is not touched.
      */
     void set_foc_fault(uint8_t fault_code) {
         _active_foc_fault = fault_code;
@@ -381,9 +355,7 @@ public:
         }
     }
 
-    /**
-     * @brief Releases fault recovery lockout once VESC fault clears and throttle is neutral.
-     */
+    /** @brief Clears the fault lock once the fault is gone and the throttle is released. */
     void update_fault_recovery(uint16_t throttle_req) {
         if (_fault_recovery_locked && _active_foc_fault == 0 && throttle_req < PowertrainConfig::THROTTLE_NEUTRAL_COUNTS) {
             _fault_recovery_locked = false;
@@ -398,9 +370,7 @@ public:
         return _active_foc_fault;
     }
 
-    /**
-     * @brief Updates comms recovery status. If comms drops, latches recovery neutral lockout.
-     */
+    /** @brief Locks drive while the VESC link is down; clears once it is back and the throttle is released. */
     void update_comms_recovery(bool vesc_online, uint16_t throttle_req) {
         if (!vesc_online) {
             _comms_recovery_locked = true;
@@ -414,11 +384,8 @@ public:
     }
 
     /**
-     * @brief Updates display comms stall recovery state.
-     *        When display stalls, latches lockout to cut torque while keeping GPIO 2 HIGH (no forced stop).
-     *        When display link restores and throttle returns to neutral (< 100 counts), clears lockout.
-     * @param[in] display_stalled True if display heartbeat/comms watchdog expired.
-     * @param[in] throttle_req Normalized throttle request (0..10000 counts).
+     * @brief Locks drive while display frames are missing (the throttle reading would be stale); clears once
+     *        frames are back and the throttle is released. The killswitch output stays high.
      */
     void update_display_recovery(bool display_stalled, uint16_t throttle_req) {
         if (display_stalled) {
@@ -432,10 +399,7 @@ public:
         return _display_recovery_locked;
     }
 
-    /**
-     * @brief Dynamically parameterizes positive torque slew rate (dI/dt) based on PA acceleration level (1..5).
-     * @param[in] pa_level P-menu PA value (1 to 5).
-     */
+    /** @brief Sets the throttle rise rate from the P-menu PA level (1..5). */
     void set_accel_level_pa(uint8_t pa_level) {
         _max_slew_per_sec = SlewConfig::get_units_per_sec(pa_level);
     }
@@ -445,19 +409,16 @@ public:
     }
 
     /**
-     * @brief Computes speed governor attenuation factor [0.0f, 1.0f] for speed-capped drive modes
-     *        using a Cubic Hermite Smoothstep over a 3.0 mph feathering window.
-     * @param[in] current_speed_mph Current vehicle road speed in mph.
-     * @param[in] speed_limit_mph Maximum speed limit for the active mode in mph (0.0f = unlimited).
-     * @return float Attenuation factor: 1.0f below taper window, smooth S-curve decay to 0.0f at limit.
+     * @brief ESP32-side speed governor: 1 below the taper window, smoothstep to 0 at the limit.
+     * @note Inactive in the firmware: main.cpp passes speed 0, so this returns 1. The speed limit is applied by
+     *       the VESC script per wheel instead, so it still works if the ESP32 link fails.
      */
     static inline float compute_speed_governor_scale(float current_speed_mph, float speed_limit_mph) {
-        if (speed_limit_mph <= 0.0f) return 1.0f; // Mode 3: Unlimited
+        if (speed_limit_mph <= 0.0f) return 1.0f;
         if (current_speed_mph >= speed_limit_mph) return 0.0f;
         const float taper_start = speed_limit_mph - PowertrainConfig::SPEED_LIMIT_TAPER_WINDOW_MPH;
         if (current_speed_mph <= taper_start) return 1.0f;
 
-        // Window normalization: t in [0.0f, 1.0f]
         float t = (speed_limit_mph - current_speed_mph) / PowertrainConfig::SPEED_LIMIT_TAPER_WINDOW_MPH;
         if (t < 0.0f) {
             t = 0.0f;
@@ -465,18 +426,11 @@ public:
             t = 1.0f;
         }
 
-        // Cubic Hermite smoothstep polynomial: S(t) = t^2 * (3.0f - 2.0f * t)
+        // Smoothstep: t^2 (3 - 2t)
         return t * t * (3.0f - 2.0f * t);
     }
 
-    /**
-     * @brief Stateful asymmetric re-engagement rate limiter for speed governor scale.
-     *        - Instantaneous attenuation on overspeed (target < current) to protect speed envelope.
-     *        - Controlled 1.0 unit/second ramp-up on speed dips (target > current) to prevent acceleration surge.
-     * @param[in] target_scale Target speed governor scale [0.0f, 1.0f].
-     * @param[in] dt_s Loop delta time in seconds.
-     * @return float Rate-limited governor scale [0.0f, 1.0f].
-     */
+    /** @brief Governor scale follows a drop at once and rises at GOVERNOR_RAMP_UP_RATE per second. */
     float update_governor_scale(float target_scale, float dt_s) {
         if (target_scale < 0.0f) {
             target_scale = 0.0f;
@@ -485,10 +439,8 @@ public:
         }
 
         if (target_scale < _governor_scale) {
-            // Instantaneous attenuation on overspeed
             _governor_scale = target_scale;
         } else if (target_scale > _governor_scale) {
-            // Controlled 1.0 unit/second ramp-up on speed dips
             if (dt_s > 0.0f && dt_s <= 0.5f) {
                 const float max_ramp = PowertrainConfig::GOVERNOR_RAMP_UP_RATE * dt_s;
                 if ((target_scale - _governor_scale) > max_ramp) {
@@ -519,12 +471,13 @@ public:
     }
 
     /**
-     * @brief Computes mode-scaled throttle with stateful asymmetric speed governor rate limiting.
-     * @param[in] normalized Normalized throttle [0.0f, 1.0f].
-     * @param[in] gear Drive gear mode: 1 (Eco: 50%, 15 mph), 2 (Std: 75%, 28 mph), 3 (Turbo: 100%, unlimited).
-     * @param[in] current_speed_mph Current vehicle road speed in mph.
-     * @param[in] dt_s Frame delta time in seconds.
-     * @return uint16_t Mode-scaled, rate-limited throttle request (0..10000).
+     * @brief Throttle request for the selected mode: normalized throttle x mode ratio x 10000, with full
+     *        throttle mapped exactly to the mode ceiling.
+     * @param[in] normalized Throttle 0..1 from the display library.
+     * @param[in] gear Mode 1, 2 or 3.
+     * @param[in] current_speed_mph Speed for the ESP32 governor (the firmware passes 0, see compute_speed_governor_scale).
+     * @param[in] dt_s Time since the previous call.
+     * @return Throttle request, 0..10000.
      */
     uint16_t compute_mode_scaled_throttle(float normalized, uint8_t gear, float current_speed_mph, float dt_s) {
         if (normalized <= 0.0f) return 0;
@@ -562,13 +515,7 @@ public:
         return static_cast<uint16_t>(roundf(target));
     }
 
-    /**
-     * @brief Normalizes raw ADC counts (0..1000) to [0.0f, 1.0f] range with plausibility clamp.
-     * @param[in] raw_adc Raw ADC reading.
-     * @param[in] deadband Threshold below which normalized throttle is 0.0f (default 15 counts).
-     * @param[in] ceiling Threshold above which normalized throttle is 1.0f (default 980 counts).
-     * @return float Normalized throttle in range [0.0f, 1.0f].
-     */
+    /** @brief Raw throttle (0..1000) to 0..1, with 0 at or below deadband and 1 at or above ceiling. Not used by the firmware, which normalizes in the display library. */
     static inline float normalize_raw_adc(uint16_t raw_adc, uint16_t deadband = 15, uint16_t ceiling = 980) {
         if (raw_adc > PowertrainConfig::PLAUSIBILITY_CLAMP_MAX) return 0.0f;
         if (raw_adc <= deadband) return 0.0f;
@@ -582,13 +529,7 @@ public:
         return compute_mode_scaled_throttle(normalize_raw_adc(raw_adc), gear, current_speed_mph, dt_s);
     }
 
-    /**
-     * @brief Scales normalized throttle [0.0f, 1.0f] according to active drive gear and speed governor (stateless).
-     * @param[in] normalized Normalized throttle [0.0f, 1.0f].
-     * @param[in] gear Drive gear mode: 1 (Eco: 50%, 15 mph), 2 (Std: 75%, 28 mph), 3 (Turbo: 100%, unlimited).
-     * @param[in] current_speed_mph Current vehicle road speed in mph (default 0.0f for pure torque scaling).
-     * @return uint16_t Mode-scaled, speed-governed throttle request (0..10000).
-     */
+    /** @brief Same as the four-argument version, without the governor's rise limit. */
     static inline uint16_t compute_mode_scaled_throttle(float normalized, uint8_t gear, float current_speed_mph = 0.0f) {
         if (normalized <= 0.0f) return 0;
 
@@ -624,46 +565,34 @@ public:
         return static_cast<uint16_t>(roundf(target));
     }
 
-    /**
-     * @brief Normalizes raw ADC (0..1000) and scales according to active drive gear and speed governor.
-     * @param[in] raw_adc Raw throttle ADC reading (0..1000 counts).
-     * @param[in] gear Drive gear mode: 1 (Eco), 2 (Std), 3 (Turbo).
-     * @param[in] current_speed_mph Current vehicle road speed in mph (default 0.0f).
-     * @return uint16_t Mode-scaled throttle request (0..10000).
-     */
+    /** @brief Same, from a raw throttle reading. */
     static inline uint16_t compute_mode_scaled_throttle(uint16_t raw_adc, uint8_t gear, float current_speed_mph = 0.0f) {
-        if (raw_adc > PowertrainConfig::PLAUSIBILITY_CLAMP_MAX) return 0; // Plausibility clamp / short circuit protection
+        if (raw_adc > PowertrainConfig::PLAUSIBILITY_CLAMP_MAX) return 0;
         return compute_mode_scaled_throttle(normalize_raw_adc(raw_adc), gear, current_speed_mph);
     }
 
-    /**
-     * @brief Scales regenerative electronic braking torque based on PB setting (0..5).
-     * @param[in] brake_active True if mechanical or electronic brake switch is active.
-     * @param[in] pb_level P-menu PB regen level (0 to 5). 0 disables regen completely.
-     * @return uint16_t Commanded brake request (0..10000 counts).
-     */
+    /** @brief Brake command while the brake is pulled: PB level x 2000 counts (PB 0 = no regen). */
     static inline uint16_t compute_pb_regen(bool brake_active, uint8_t pb_level) {
-        if (!brake_active || pb_level == 0) return 0; // PB=0 strictly disables electronic braking
+        if (!brake_active || pb_level == 0) return 0;
         if (pb_level > PowertrainConfig::PB_REGEN_MAX_LEVEL) pb_level = PowertrainConfig::PB_REGEN_MAX_LEVEL;
         return static_cast<uint16_t>(pb_level * PowertrainConfig::REGEN_COUNTS_PER_LEVEL);
     }
 
-    /**
-     * @brief Returns true if brake was released while throttle was held (Whiskey-Throttle Lockout).
-     */
+    /** @brief True while throttle is held at zero because the brake was released with the throttle open. */
     bool is_brake_release_locked() const {
         return _brake_release_locked;
     }
 
     /**
-     * @brief Computes safe, failsafe-governed control payload for transmission to VESC.
-     * @param[in] raw_throttle Normalized throttle request (0..10000).
-     * @param[in] brake_request Proportional regenerative brake request (0..10000).
-     * @param[in] dual_mode True if dual motor drive requested.
-     * @param[in] can_desync True if front VESC CAN link is currently offline.
-     * @param[in] vesc_online True if VESC UART connection is active.
-     * @param[in] dt_s Frame delta time in seconds for slew rate ramping.
-     * @return TXPayloadControl Type-safe, fail-safe sanitized control payload.
+     * @brief Builds the control frame payload from the rider inputs and the current lockouts.
+     * @param[in] raw_throttle Throttle request, 0..10000 (mode scaling already applied).
+     * @param[in] brake_request Regen request, 0..10000.
+     * @param[in] physical_brake_active Brake lever pulled.
+     * @param[in] dual_mode Rider selected dual drive.
+     * @param[in] can_desync Front VESC lost.
+     * @param[in] vesc_online VESC telemetry current.
+     * @param[in] dt_s Time since the previous call, for the rise limiter.
+     * @param[in] speed_limit_cms Mode speed limit for the script, 0 = none.
      */
     TXPayloadControl compute_safe_control(uint16_t raw_throttle,
                                           uint16_t brake_request,
@@ -678,7 +607,7 @@ public:
         out.dual_mode = (dual_mode && !can_desync && !_can_recovery_locked) ? 1 : 0;
         out.speed_limit_cms = speed_limit_cms;
 
-        // Active Brake Priority: Mechanical or electronic brake unconditionally zeroes throttle
+        // Brake wins over throttle
         const bool brake_active = physical_brake_active || (brake_request > 0);
         if (brake_active) {
             _last_brake_active = true;
@@ -687,8 +616,7 @@ public:
             out.throttle = 0;
             return out;
         } else {
-            // Check for Brake-Release Launch Lockout transition:
-            // If brake was active and is now released while throttle is still open
+            // Brake released with the throttle open: hold throttle at zero until it is released
             if (_last_brake_active) {
                 _last_brake_active = false;
                 if (raw_throttle >= PowertrainConfig::THROTTLE_NEUTRAL_COUNTS) {
@@ -697,7 +625,6 @@ public:
             }
         }
 
-        // Release launch lockout strictly when rider returns throttle to neutral (< 1%)
         if (_brake_release_locked) {
             if (raw_throttle < PowertrainConfig::THROTTLE_NEUTRAL_COUNTS) {
                 _brake_release_locked = false;
@@ -709,43 +636,38 @@ public:
             }
         }
 
-        // Check CAN recovery neutral lock
         update_can_recovery(raw_throttle);
 
-        // Check fault recovery neutral release
         update_fault_recovery(raw_throttle);
 
-        // Check comms recovery neutral lock
         update_comms_recovery(vesc_online, raw_throttle);
 
-        // Fail-Safe Invariants:
-        // Must be armed, VESC online, fault lockout clear, comms recovery clear, display recovery clear, and throttle above neutral
+        // Drive only when armed, the VESC is online, no lockout is active and the throttle is above neutral
         float target_throttle = 0.0f;
         if (is_armed() && vesc_online && !_fault_recovery_locked && !_comms_recovery_locked && !_display_recovery_locked && raw_throttle >= PowertrainConfig::THROTTLE_NEUTRAL_COUNTS) {
-            // Full power preserved in limp mode; rider manually governs output via Gear 1 or 2
+            // With the front VESC lost the rear keeps the full mode ceiling: one working motor is better than
+            // none, and the rider limits power with the throttle and the mode
             target_throttle = static_cast<float>(raw_throttle);
         }
 
-        // Slew rate limiting ramp with bounded effective delta time
+        // Rise limited by the PA rate; release is immediate
         const float effective_dt = (dt_s < PowertrainConfig::MIN_SLEW_DT_SEC) ? PowertrainConfig::MIN_SLEW_DT_SEC :
                                    ((dt_s > PowertrainConfig::MAX_SLEW_DT_SEC) ? PowertrainConfig::MAX_SLEW_DT_SEC : dt_s);
         const float max_step = _max_slew_per_sec * effective_dt;
         if (target_throttle > _ramped_throttle) {
             _ramped_throttle += (target_throttle - _ramped_throttle > max_step) ? max_step : (target_throttle - _ramped_throttle);
         } else {
-            // Immediate roll-off on decel
             _ramped_throttle = target_throttle;
         }
 
-        // Boundary snapping within 1 count to eliminate floating-point precision lag
+        // Snap to the target when within 1 count
         if (fabsf(target_throttle - _ramped_throttle) < PowertrainConfig::THROTTLE_SNAP_EPSILON) {
             _ramped_throttle = target_throttle;
         }
 
-        // Round to nearest integer count
         uint16_t target_int = static_cast<uint16_t>(lroundf(_ramped_throttle));
 
-        // Clamp mode ceilings to prevent deadband dropping
+        // Within 1 count of a mode ceiling: use the ceiling exactly, so the jitter hold below never stops short of it
         if (target_int >= PowertrainConfig::MODE_3_MAX_COUNTS - 1) {
             target_int = PowertrainConfig::MODE_3_MAX_COUNTS;
         } else if (target_int >= PowertrainConfig::MODE_2_MAX_COUNTS - 1 && target_int <= PowertrainConfig::MODE_2_MAX_COUNTS) {
@@ -754,8 +676,8 @@ public:
             target_int = PowertrainConfig::MODE_1_MAX_COUNTS;
         }
 
-        // Commanded current deadband enforcement (0.60A on 120A scale = 50 counts):
-        // Eliminates 50 Hz cruising coil hissing from minor ADC ripple
+        // Jitter hold: only send a new value when it moved by THROTTLE_DEADBAND_COUNTS, reaches zero, or hits a
+        // mode ceiling
         if (target_int == 0) {
             _last_dispatched_throttle = 0;
             out.throttle = 0;
@@ -772,18 +694,7 @@ public:
         return out;
     }
 
-    /**
-     * @brief Computes safe, failsafe-governed control payload with explicit display stall watchdog status.
-     * @param[in] raw_throttle Normalized throttle request (0..10000).
-     * @param[in] brake_request Proportional regenerative brake request (0..10000).
-     * @param[in] physical_brake_active True if physical brake switch is pulled.
-     * @param[in] dual_mode True if dual motor drive requested.
-     * @param[in] can_desync True if front VESC CAN link is currently offline.
-     * @param[in] vesc_online True if VESC UART connection is active.
-     * @param[in] dt_s Frame delta time in seconds for slew rate ramping.
-     * @param[in] display_stalled True if display heartbeat watchdog has expired.
-     * @return TXPayloadControl Type-safe, fail-safe sanitized control payload.
-     */
+    /** @brief Same, also updating the display stall lock. */
     TXPayloadControl compute_safe_control(uint16_t raw_throttle,
                                           uint16_t brake_request,
                                           bool physical_brake_active,
@@ -798,9 +709,8 @@ public:
     }
 
     /**
-     * @brief Evaluates unified diagnostic fault classification based on vehicle supervisory hierarchy.
-     * @note Directly synchronized with canonical physical killswitch GPIO state.
-     *       Supports 1000ms time-sliced alternating rotation between coexisting faults.
+     * @brief Fault to show on the display. A lost VESC link overrides everything. Otherwise the first two active
+     *        conditions, in the order below, alternate every FAULT_CYCLE_PERIOD_MS (now_ms = 0 shows the first).
      */
     SafetyFault evaluate_fault(bool vesc_online, bool can_desync, uint16_t throttle_req = 0, uint32_t now_ms = 0) const {
         (void)throttle_req;
@@ -827,7 +737,7 @@ public:
             if (primary == SafetyFault::None) primary = SafetyFault::DisplayStalled;
             else if (secondary == SafetyFault::None) secondary = SafetyFault::DisplayStalled;
         }
-        // Direct physical killswitch GPIO state synchronization:
+        // Read the killswitch pin itself, so the display shows what the VESC sees
         const bool hw_armed = (_killswitch_pin >= 0) ? (digitalRead(_killswitch_pin) == HIGH) : is_armed();
         if (!hw_armed || _brake_release_locked) {
             if (primary == SafetyFault::None) primary = SafetyFault::KillswitchDisarmed;
@@ -837,7 +747,6 @@ public:
         if (primary == SafetyFault::None) return SafetyFault::None;
         if (secondary == SafetyFault::None || now_ms == 0) return primary;
 
-        // Time-sliced alternating rotation every 1000ms
         const uint32_t phase = (now_ms / PowertrainConfig::FAULT_CYCLE_PERIOD_MS) % 2;
         return (phase == 0) ? primary : secondary;
     }

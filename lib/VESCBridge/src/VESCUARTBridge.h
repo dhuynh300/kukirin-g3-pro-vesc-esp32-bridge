@@ -1,174 +1,148 @@
-//! KNOWN PITFALLS & FAILURE MODES:
-//! - P01 [VESC UART Baud Rate]: Must strictly operate at 230,400 bps. 115,200 bps causes framing corruption and link loss.
-//! - P10 [Dead-man Watchdog]: 5 missed frames (100ms) trips failsafe: Ticks 1-4 Zero-Order Hold (ZOH), Tick 5 cuts torque to 0.0A freewheel.
-//! - P11 [Multi-Packet Pacing]: Secondary debug/telemetry packets must not be dispatched back-to-back on same tick (enforce >= 2ms wire gap).
-//! - P12 [Packet Framing & CRC]: Frames use 0xAA 0x55 header with CCITT CRC16. Sliding-window resync via memmove required on CRC error.
-//! - P13 [Zero Heap Allocation]: Control path must never invoke malloc/new/free in real-time loops.
-
 #pragma once
 
 #include <Arduino.h>
 
 /**
  * @namespace VESCConfig
- * @brief Authoritative configuration constants for VESC powertrain and CAN bus topology.
+ * @brief CAN IDs of the two VESCs. vesc/main.lbm defines the same values (checked by tools/check_shared_constants.py).
  */
 namespace VESCConfig {
-    static constexpr uint8_t CAN_ID_REAR_VESC  = 26;  /**< @brief Master Rear VESC controller connected via UART1. */
-    static constexpr uint8_t CAN_ID_FRONT_VESC = 123; /**< @brief Slave Front VESC controller connected via CAN bus. */
+    static constexpr uint8_t CAN_ID_REAR_VESC  = 26;  /**< @brief Rear VESC: runs the LispBM script, connected to the ESP32 by UART. */
+    static constexpr uint8_t CAN_ID_FRONT_VESC = 123; /**< @brief Front VESC: commanded by the rear VESC over CAN. */
 }
 
 /**
  * @struct TXPayloadControl
- * @brief Binary control payload transmitted to the VESC LispBM motor control thread.
- * @details Transmits normalized throttle, regenerative brake commands, dual-motor flags, and speed limit in cm/s.
- * @note Enforces 1-byte struct alignment via `__attribute__((packed))`. Total size: 7 bytes.
+ * @brief Control frame payload, ESP32 to rear VESC (7 bytes, packed, little-endian).
  */
 struct __attribute__((packed)) TXPayloadControl {
-    uint16_t throttle;        /**< @brief Normalized throttle request (0 to 10000 corresponding to 0.0% to 100.0%). Offset: 0-1. */
-    uint16_t brake;           /**< @brief Normalized regenerative brake request (0 to 10000 corresponding to 0.0% to 100.0%). Offset: 2-3. */
-    uint8_t  dual_mode;       /**< @brief Dual motor drive mode flag (1 = Dual Drive, 0 = Single Motor). Offset: 4. */
-    uint16_t speed_limit_cms; /**< @brief Speed ceiling in cm/s (0 = Unlimited / Mode 3). Offset: 5-6. */
+    uint16_t throttle;        /**< @brief Throttle, 0..10000 counts = 0..100 % of the VESC current limit. Offset 0. */
+    uint16_t brake;           /**< @brief Regen brake, 0..10000 counts. Offset 2. */
+    uint8_t  dual_mode;       /**< @brief 1 = drive both motors, 0 = rear only. Offset 4. */
+    uint16_t speed_limit_cms; /**< @brief Speed limit in cm/s, applied per wheel by the VESC script; 0 = no limit. Offset 5. */
 };
 
 /**
  * @struct RXTelemetryPayload
- * @brief Binary telemetry payload received from the VESC LispBM telemetry thread.
- * @details Contains motor speed feedback in cm/s (m/s * 100).
- * @note Enforces 1-byte struct alignment via `__attribute__((packed))`. Total size: 3 bytes.
+ * @brief Telemetry payload, rear VESC to ESP32, sent once per script loop (3 bytes, packed, little-endian).
  */
 struct __attribute__((packed)) RXTelemetryPayload {
-    int16_t speed;       /**< @brief Vehicle speed in cm/s (m/s * 100). Offset: 0-1. Valid range: -327.68 to +327.67 m/s (~733 mph). */
-    uint8_t fault_flags; /**< @brief Diagnostic fault flags (Bit 0: Front VESC CAN desync > 0.1s). Offset: 2. */
+    int16_t speed;       /**< @brief Speed of the faster wheel in cm/s. Offset 0. */
+    uint8_t fault_flags; /**< @brief Bit 0: front VESC lost (no CAN status for 500 ms). Bits 1-7: rear VESC fault code. Offset 2. */
 };
 
 /**
  * @struct TXPayloadTestCommand
- * @brief Test harness command payload dispatched to VESC LispBM for automated closed-loop testing.
- * @note Enforces 1-byte struct alignment via `__attribute__((packed))`. Total size: 5 bytes.
+ * @brief Command payload of the bench test harness (5 bytes, packed). Not sent by the firmware.
  */
 struct __attribute__((packed)) TXPayloadTestCommand {
-    uint8_t test_id;         /**< @brief Active test case ID (1..20). Offset: 0. */
-    uint8_t sim_flags;       /**< @brief Simulation flags (B0: Force CAN desync, B1: Synth speed, B2: Force PLC decay). Offset: 1. */
-    int16_t sim_speed_cm_s;  /**< @brief Synthetic speed in cm/s (0.01 m/s). Offset: 2-3. */
-    uint8_t reserved;        /**< @brief Plausibility padding (0x00). Offset: 4. */
+    uint8_t test_id;         /**< @brief Test case ID. Offset 0. */
+    uint8_t sim_flags;       /**< @brief Bit 0: simulate front VESC loss, bit 1: use sim_speed_cm_s, bit 2: simulate dropped control frames. Offset 1. */
+    int16_t sim_speed_cm_s;  /**< @brief Simulated speed in cm/s. Offset 2. */
+    uint8_t reserved;        /**< @brief Always 0. Offset 4. */
 };
 
 /**
  * @struct RXPayloadTestFeedback
- * @brief Evaluation feedback payload returned by VESC LispBM to ESP32 for closed-loop assertion.
- * @note Enforces 1-byte struct alignment via `__attribute__((packed))`. Total size: 8 bytes.
+ * @brief Result payload of the bench test harness (8 bytes, packed). Not sent by the production script.
  */
 struct __attribute__((packed)) RXPayloadTestFeedback {
-    uint8_t ack_test_id;         /**< @brief Echoed test case ID. Offset: 0. */
-    uint8_t eval_flags;          /**< @brief Safety interlock bitmask (B0: Brake priority, B1: Unarmed lock, B2: Clamp, B3: Deadman, B4: CAN desync, B5: Re-arm lock, B6: CRC err, B7: Frame err). Offset: 1. */
-    int16_t sim_rear_current;    /**< @brief Commanded/simulated Rear phase current in 0.1A units (e.g. 225 = 22.5A). Offset: 2-3. */
-    int16_t sim_front_current;   /**< @brief Commanded/simulated Front phase current in 0.1A units. Offset: 4-5. */
-    int16_t measured_speed;      /**< @brief Computed vehicle speed in cm/s. Offset: 6-7. */
+    uint8_t ack_test_id;         /**< @brief Test case ID being answered. Offset 0. */
+    uint8_t eval_flags;          /**< @brief Bits: 0 brake priority, 1 unarmed lock, 2 clamp, 3 dead-man, 4 front lost, 5 re-arm lock, 6 CRC error, 7 frame error. Offset 1. */
+    int16_t sim_rear_current;    /**< @brief Rear motor current command in 0.1 A. Offset 2. */
+    int16_t sim_front_current;   /**< @brief Front motor current command in 0.1 A. Offset 4. */
+    int16_t measured_speed;      /**< @brief Vehicle speed in cm/s. Offset 6. */
 };
 
 /**
  * @enum MessageType
- * @brief Binary protocol message type identifiers for ESP32 <-> VESC UART communication.
+ * @brief Message types on the ESP32-VESC link. vesc/main.lbm defines the same values.
  */
 enum MessageType : uint8_t {
-    MSG_TX_HEARTBEAT  = 0x00, /**< @brief Keep-alive heartbeat message (Length 0, transmitted at 10/50 Hz). */
-    MSG_TX_CONTROL    = 0x01, /**< @brief Real-time throttle and brake control command payload. */
-    MSG_TX_AUDIO      = 0x02, /**< @brief Quantized 8-bit PCM audio sample stream for FOC motor sound. */
-    MSG_RX_TELEMETRY  = 0x03, /**< @brief Live vehicle telemetry feedback from VESC. */
-    MSG_TEST_COMMAND  = 0x04, /**< @brief Closed-loop automated test command payload. */
-    MSG_TEST_FEEDBACK = 0x05, /**< @brief Closed-loop evaluation feedback payload from VESC LispBM. */
-    MSG_TX_DEBUG_LOG  = 0x06  /**< @brief ASCII diagnostic string tunneled to VESC Tool BLE terminal. */
+    MSG_TX_HEARTBEAT  = 0x00, /**< @brief Keepalive, no payload. */
+    MSG_TX_CONTROL    = 0x01, /**< @brief TXPayloadControl. */
+    MSG_TX_AUDIO      = 0x02, /**< @brief 8-bit PCM audio for motor-coil sound (planned; the script does not handle it yet). */
+    MSG_RX_TELEMETRY  = 0x03, /**< @brief RXTelemetryPayload. */
+    MSG_TEST_COMMAND  = 0x04, /**< @brief TXPayloadTestCommand (bench test harness). */
+    MSG_TEST_FEEDBACK = 0x05, /**< @brief RXPayloadTestFeedback (bench test harness). */
+    MSG_TX_DEBUG_LOG  = 0x06  /**< @brief ASCII log line, printed by the script to the VESC Tool terminal. */
 };
 
 /**
  * @class VESCUARTBridge
- * @brief Handles framing, CRC16 validation, heartbeats, and zero-copy dispatch for ESP32 <-> VESC communication.
- * @details Operates over hardware serial (230,400 bps standard) with CRC16-CCITT packet integrity checks.
- *          Enforces automatic 100ms dead-man heartbeat transmission and 50ms RX framing timeout watchdog.
- * @note Core affinity: Core 1 (real-time vehicle loop). Non-blocking, zero dynamic memory allocation.
+ * @brief Framed serial link to the rear VESC.
+ *
+ * Frame: 0xAA 0x55, type, length, payload, CRC16-CCITT (polynomial 0x1021, initial value 0, over type, length
+ * and payload), CRC sent high byte first. The baud rate must match `VESC-UART-BAUD` in vesc/main.lbm.
+ * The receiver drops a partial frame after 50 ms of silence and, after a CRC error, rescans the bytes it
+ * already has for the next 0xAA 0x55 instead of discarding them. No heap allocation.
  */
 class VESCUARTBridge {
 public:
     /**
-     * @brief Zero-allocation message dispatcher callback function pointer type.
-     * @param[in] type Decoded MessageType enum value.
-     * @param[in] payload Pointer to the verified payload byte array.
-     * @param[in] len Length in bytes of the payload.
+     * @brief Called for every received frame that passes the CRC check.
+     * @param[in] type Message type.
+     * @param[in] payload Payload bytes; valid only during the call.
+     * @param[in] len Payload length in bytes.
      */
     typedef void (*MessageCallback)(MessageType type, const uint8_t* payload, uint8_t len);
 
     /**
-     * @brief Constructs a new VESC UART Bridge instance and initializes the hardware serial interface.
-     * @param[in] serial_port Pointer to HardwareSerial peripheral (e.g. &Serial1).
-     * @param[in] baud_rate Serial baud rate (defaults to 230,400 bps standard).
-     * @param[in] rx_pin ESP32 GPIO pin for UART RX. Valid range: 0-39 (default GPIO 34).
-     * @param[in] tx_pin ESP32 GPIO pin for UART TX. Valid range: 0-33 (default GPIO 32).
+     * @brief Stores the port settings; call begin() to open the port.
+     * @param[in] serial_port Hardware UART, e.g. &Serial1.
+     * @param[in] baud_rate Baud rate.
+     * @param[in] rx_pin RX GPIO (input-only pins 34-39 are fine).
+     * @param[in] tx_pin TX GPIO (must be output-capable, 0-33).
      */
     VESCUARTBridge(HardwareSerial* serial_port, uint32_t baud_rate = 230400, int8_t rx_pin = 34, int8_t tx_pin = 32);
-    
+
     /**
-     * @brief Initializes or reconfigures the hardware serial port (safe to call in setup()).
-     * @param[in] baud_rate Serial baud rate (defaults to constructor value if 0).
-     * @param[in] rx_pin ESP32 GPIO pin for UART RX (defaults to constructor value if -1).
-     * @param[in] tx_pin ESP32 GPIO pin for UART TX (defaults to constructor value if -1).
+     * @brief Opens (or reopens) the serial port with a 512-byte receive buffer.
+     * @param[in] baud_rate 0 keeps the constructor value.
+     * @param[in] rx_pin -1 keeps the constructor value.
+     * @param[in] tx_pin -1 keeps the constructor value.
      */
     void begin(uint32_t baud_rate = 0, int8_t rx_pin = -1, int8_t tx_pin = -1);
 
-    /**
-     * @brief Destructor that cleans up FreeRTOS synchronization primitives.
-     * @note Core affinity: Core 1 / Core 0.
-     */
+    /** @brief Deletes the transmit mutex. */
     virtual ~VESCUARTBridge();
-    
-    /**
-     * @brief Real-time update loop handling RX stream processing, framing watchdogs, and keep-alive heartbeats.
-     * @note Must be called continuously in loop() on Core 1. Non-blocking, bounded iteration loop.
-     */
-    void update(); 
 
     /**
-     * @brief Transmits a structured binary message with framing and CRC16-CCITT to the VESC.
-     * @param[in] type The MessageType identifier.
-     * @param[in] payload Pointer to the binary payload data buffer (may be nullptr if len == 0).
-     * @param[in] len Length in bytes of the payload. Valid range: 0 to 255.
-     * @return bool True if successfully formatted and written to the UART TX FIFO; false on mutex timeout or invalid arguments.
-     * @note Thread-safe across Core 0 and Core 1 via bounded mutex. Zero-copy transmission directly to hardware TX buffer.
-     * @see MessageType, calculate_crc16
+     * @brief Reads up to 512 received bytes, drops a stale partial frame, and sends a keepalive when due.
+     *        Call from loop(); does not block.
+     */
+    void update();
+
+    /**
+     * @brief Frames and writes one message to the UART.
+     * @param[in] type Message type.
+     * @param[in] payload Payload bytes (may be nullptr when len is 0).
+     * @param[in] len Payload length, 0..255.
+     * @return False if the transmit mutex was not free within 10 ms or the arguments are invalid.
+     * @note Safe to call from both cores. Log and audio frames, and any frame right after one, wait until 2 ms
+     *       have passed since the previous frame; this wait is a busy loop of up to 2 ms.
      */
     bool send_message(MessageType type, const uint8_t* payload, uint8_t len);
 
-    /**
-     * @brief Transmits a structured control payload (MSG_TX_CONTROL) to the VESC.
-     * @param[in] payload Reference to TXPayloadControl containing throttle, brake, and drive mode.
-     * @return bool True if successfully formatted and written to the UART TX FIFO; false on error.
-     */
+    /** @brief Sends a control frame. Returns false on mutex timeout. */
     inline bool send_control(const TXPayloadControl& payload) {
         return send_message(MSG_TX_CONTROL, reinterpret_cast<const uint8_t*>(&payload), sizeof(TXPayloadControl));
     }
 
     /**
-     * @brief Transmits an ASCII debug log string (MSG_TX_DEBUG_LOG) tunneled to VESC Tool mobile BLE terminal.
-     * @param[in] str Null-terminated ASCII text string. Clamped to 120 bytes max.
-     * @return bool True if successfully formatted and dispatched; false on error or null pointer.
-     * @note Non-blocking, zero dynamic heap allocation.
+     * @brief Sends a log line for the VESC Tool terminal. Longer strings are cut to 120 bytes, the script's
+     *        payload limit. The VESC's serial receive queue holds 128 bytes, so a long line can crowd out a
+     *        control frame (docs/pitfalls.md).
      */
     inline bool send_debug_log(const char* str) {
         if (!str) return false;
         size_t len = strlen(str);
         if (len == 0) return true;
         if (len > 120) len = 120;
-        // Wire pacing enforced centrally in send_message (>= 2ms gap for all non-heartbeat frames)
         return send_message(MSG_TX_DEBUG_LOG, reinterpret_cast<const uint8_t*>(str), static_cast<uint8_t>(len));
     }
 
-    /**
-     * @brief Formats and transmits a printf-style diagnostic string tunneled to VESC Tool mobile BLE terminal.
-     * @param[in] fmt Printf format string.
-     * @param[in] ... Variable format arguments.
-     * @return bool True if successfully formatted and dispatched; false on error or null pointer.
-     * @note Stack-allocated 128-byte buffer. Strictly zero heap allocation. Clamped to 120 bytes max.
-     */
+    /** @brief printf-style send_debug_log(), formatted into a 128-byte stack buffer and cut to 120 bytes. */
     inline bool send_debug_logf(const char* fmt, ...) {
         if (!fmt) return false;
         char buf[128];
@@ -178,116 +152,79 @@ public:
         va_end(args);
         if (len <= 0) return false;
         if (len > 120) len = 120;
-        // Wire pacing enforced centrally in send_message (>= 2ms gap for all non-heartbeat frames)
         return send_message(MSG_TX_DEBUG_LOG, reinterpret_cast<const uint8_t*>(buf), static_cast<uint8_t>(len));
     }
 
-    /**
-     * @brief Registers the callback invoked upon successful decoding and CRC validation of an incoming frame.
-     * @param[in] cb Static function pointer of type MessageCallback. Pass nullptr to disable.
-     * @note Zero heap allocation. Core affinity: Core 1.
-     */
+    /** @brief Sets the receive callback; nullptr disables it. */
     void set_receive_callback(MessageCallback cb);
 
     /**
-     * @brief Configures the keepalive heartbeat transmission interval in milliseconds.
-     * @param[in] interval_ms Period in ms between keepalive heartbeats (default 20ms for 50Hz streaming).
-     *                        Set to 0 to disable automatic keepalives.
-     * @note Production standard is 20ms (50Hz).
+     * @brief Sends a keepalive frame whenever nothing was sent for interval_ms (default 20 ms; 0 disables).
+     *        The firmware disables it because its own control frames, at least every 20 ms, keep the link alive.
      */
     void set_heartbeat_interval_ms(uint32_t interval_ms) { _heartbeat_interval_ms = interval_ms; }
 
-    /**
-     * @brief Gets the configured keepalive heartbeat transmission interval in milliseconds.
-     * @return uint32_t Heartbeat period in ms.
-     */
+    /** @brief Keepalive interval in ms (0 = disabled). */
     uint32_t get_heartbeat_interval_ms() const { return _heartbeat_interval_ms; }
 
     /**
-     * @brief Checks if valid telemetry packets have been received from VESC within the specified timeout.
-     * @param[in] timeout_ms Maximum allowable silence threshold in ms (default 100ms = 5 frames at 50Hz).
-     * @return bool True if connection is alive and healthy; false if timed out or not yet received.
+     * @brief True if a valid frame arrived within the last timeout_ms. The firmware passes
+     *        PowertrainConfig::VESC_COMMS_TIMEOUT_MS (500 ms); the 100 ms default is not used.
      */
     bool is_connected(uint32_t timeout_ms = 100) const;
 
-    /**
-     * @brief Returns the timestamp in milliseconds of the last successfully decoded, CRC-verified packet.
-     * @return uint32_t Millis timestamp of last valid frame.
-     */
+    /** @brief millis() when the last valid frame arrived; 0 if none yet. */
     uint32_t get_last_valid_rx_ms() const;
 
 private:
-    /**
-     * @brief Transmits a zero-length keep-alive heartbeat frame (MSG_TX_HEARTBEAT).
-     * @note Core affinity: Core 1. Zero dynamic memory allocation.
-     * @see MSG_TX_HEARTBEAT, send_message
-     */
+    /** @brief Sends an empty MSG_TX_HEARTBEAT frame. */
     void send_heartbeat();
 
-    /**
-     * @brief Feed a single incoming serial byte into the RX framing state machine.
-     * @param[in] incoming_byte Raw byte from UART RX FIFO. Valid range: 0x00 to 0xFF.
-     * @note Core affinity: Core 1. Zero dynamic memory allocation.
-     */
+    /** @brief Advances the receive state machine by one byte. */
     void process_incoming_byte(uint8_t incoming_byte);
 
-    /**
-     * @brief Computes single-pass CRC16-CCITT (Polynomial 0x1021) with initial value 0x0000.
-     * @param[in] data Pointer to input data buffer.
-     * @param[in] len Number of bytes to process.
-     * @return uint16_t Computed CRC16 checksum.
-     * @note Thread-safe, reentrant, zero allocation.
-     */
+    /** @brief CRC16-CCITT (polynomial 0x1021, initial value 0) of one buffer. */
     uint16_t calculate_crc16(const uint8_t *data, uint16_t len);
 
-    /**
-     * @brief Computes running CRC16-CCITT across discontinuous memory buffers.
-     * @param[in] data Pointer to input data chunk.
-     * @param[in] len Number of bytes in this chunk.
-     * @param[in] current_crc Running CRC accumulator from previous segments.
-     * @return uint16_t Updated running CRC16 checksum.
-     * @note Thread-safe, reentrant, zero allocation.
-     */
+    /** @brief Continues a CRC16-CCITT over another buffer, starting from current_crc. */
     uint16_t calculate_crc16(const uint8_t *data, uint16_t len, uint16_t current_crc);
 
-    HardwareSerial* _serial = nullptr;                                  /**< @brief Hardware UART stream pointer. */
-    MessageCallback _on_message = nullptr;                              /**< @brief Registered RX callback. */
-    SemaphoreHandle_t _tx_mutex = nullptr;                              /**< @brief Mutex protecting concurrent UART packet transmission across cores. */
-    uint32_t _baud_rate = 230400;                                       /**< @brief Configured UART baud rate. */
-    int8_t _rx_pin = -1;                                                /**< @brief Configured UART RX pin. */
-    int8_t _tx_pin = -1;                                                /**< @brief Configured UART TX pin. */
-    
-    // Configuration & Protocol Constants
-    uint32_t _heartbeat_interval_ms = 20;                               /**< @brief Keepalive heartbeat interval (default 20ms = 50Hz standard; 0 = disabled). */
-    static const uint32_t FRAMING_TIMEOUT_MS = 50;                     /**< @brief Purge partial RX packets after 50ms idle. */
-    static const uint16_t MAX_PAYLOAD_SIZE = 256;                      /**< @brief Upper size limit for payload buffers. */
-    static const uint8_t START_BYTE_1 = 0xAA;                          /**< @brief Protocol header sync byte 1. */
-    static const uint8_t START_BYTE_2 = 0x55;                          /**< @brief Protocol header sync byte 2. */
+    HardwareSerial* _serial = nullptr;                                  /**< @brief UART in use. */
+    MessageCallback _on_message = nullptr;                              /**< @brief Receive callback. */
+    SemaphoreHandle_t _tx_mutex = nullptr;                              /**< @brief Keeps frames sent from two cores from interleaving. */
+    uint32_t _baud_rate = 230400;                                       /**< @brief Baud rate. */
+    int8_t _rx_pin = -1;                                                /**< @brief RX GPIO. */
+    int8_t _tx_pin = -1;                                                /**< @brief TX GPIO. */
 
-    // State Variables
-    uint32_t _last_tx_time = 0;                                         /**< @brief Timestamp of most recent TX packet (ms). */
-    uint32_t _last_tx_micros = 0;                                       /**< @brief High-resolution timestamp of most recent TX packet (us). */
-    bool _last_tx_was_secondary = false;                                /**< @brief True if previous TX frame was a secondary packet requiring >= 2ms pacing. */
-    uint32_t _last_rx_byte_time = 0;                                    /**< @brief Timestamp of most recent RX byte received. */
-    uint32_t _last_valid_rx_time = 0;                                   /**< @brief Timestamp of most recent verified CRC-passing packet. */
-    
-    /** @brief RX parsing state machine states. */
-    enum RXState { 
-        WAIT_START_1, 
-        WAIT_START_2, 
-        EXPECT_TYPE, 
-        EXPECT_LEN, 
-        EXPECT_PAYLOAD, 
-        EXPECT_CRC1, 
-        EXPECT_CRC2 
+    uint32_t _heartbeat_interval_ms = 20;                               /**< @brief Keepalive interval in ms; 0 = disabled. */
+    static const uint32_t FRAMING_TIMEOUT_MS = 50;                     /**< @brief Drop a partial frame after this much silence. */
+    static const uint16_t MAX_PAYLOAD_SIZE = 256;                      /**< @brief Receive buffer size. */
+    static const uint8_t START_BYTE_1 = 0xAA;                          /**< @brief First frame start byte. */
+    static const uint8_t START_BYTE_2 = 0x55;                          /**< @brief Second frame start byte. */
+
+    uint32_t _last_tx_time = 0;                                         /**< @brief millis() of the last frame sent. */
+    uint32_t _last_tx_micros = 0;                                       /**< @brief micros() of the last frame sent, for the 2 ms gap. */
+    bool _last_tx_was_secondary = false;                                /**< @brief True if the last frame sent was a log or audio frame. */
+    uint32_t _last_rx_byte_time = 0;                                    /**< @brief millis() of the last byte received. */
+    uint32_t _last_valid_rx_time = 0;                                   /**< @brief millis() of the last frame that passed the CRC check. */
+
+    /** @brief Receive state machine states. */
+    enum RXState {
+        WAIT_START_1,
+        WAIT_START_2,
+        EXPECT_TYPE,
+        EXPECT_LEN,
+        EXPECT_PAYLOAD,
+        EXPECT_CRC1,
+        EXPECT_CRC2
     };
-    RXState _rx_state = WAIT_START_1;                                   /**< @brief Active parsing state. */
-    
-    MessageType _rx_type = MSG_TX_HEARTBEAT;                            /**< @brief Decoded packet message type. */
-    uint8_t _rx_len = 0;                                                /**< @brief Decoded payload length. */
-    uint8_t _rx_buffer[MAX_PAYLOAD_SIZE];                               /**< @brief Static RX payload buffer (zero dynamic allocation). */
-    uint8_t _rx_index = 0;                                              /**< @brief Current payload index. */
-    uint8_t _rx_crc_high = 0;                                           /**< @brief Received CRC high byte. */
+    RXState _rx_state = WAIT_START_1;                                   /**< @brief Current receive state. */
+
+    MessageType _rx_type = MSG_TX_HEARTBEAT;                            /**< @brief Type of the frame being received. */
+    uint8_t _rx_len = 0;                                                /**< @brief Length of the frame being received. */
+    uint8_t _rx_buffer[MAX_PAYLOAD_SIZE];                               /**< @brief Payload of the frame being received. */
+    uint8_t _rx_index = 0;                                              /**< @brief Bytes of payload received so far. */
+    uint8_t _rx_crc_high = 0;                                           /**< @brief CRC high byte, waiting for the low byte. */
 };
 
 #include "VESCSafety.h"
