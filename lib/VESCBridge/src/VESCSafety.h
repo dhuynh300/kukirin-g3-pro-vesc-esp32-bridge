@@ -4,35 +4,6 @@
 #include <math.h>
 #include "VESCUARTBridge.h"
 
-// Unit conversion macros
-#ifndef MS_TO_SEC
-#define MS_TO_SEC(ms)        ((ms) * 0.001f)
-#endif
-#ifndef SEC_TO_MS
-#define SEC_TO_MS(sec)       ((sec) * 1000.0f)
-#endif
-#ifndef MPH_TO_MPS
-#define MPH_TO_MPS(mph)      ((mph) * 0.44704f)
-#endif
-#ifndef MPS_TO_MPH
-#define MPS_TO_MPH(mps)      ((mps) * 2.23693629f)
-#endif
-#ifndef MPS_TO_CMS
-#define MPS_TO_CMS(mps)      ((mps) * 100.0f)
-#endif
-#ifndef CMS_TO_MPS
-#define CMS_TO_MPS(cms)      ((cms) * 0.01f)
-#endif
-#ifndef CMS_TO_MPH
-#define CMS_TO_MPH(cms)      ((cms) * 0.0223693629f)
-#endif
-#ifndef COUNTS_TO_RATIO
-#define COUNTS_TO_RATIO(cnt) ((static_cast<float>(cnt)) * 0.0001f)
-#endif
-#ifndef RATIO_TO_COUNTS
-#define RATIO_TO_COUNTS(r)   ((r) * 10000.0f)
-#endif
-
 namespace VESCBridge {
 
 /**
@@ -67,16 +38,9 @@ namespace PowertrainConfig {
     // Wheel and motor
     static constexpr float WHEEL_DIAMETER_INCHES        = 10.0f;                                      /**< Nominal wheel diameter. */
     static constexpr uint8_t MOTOR_POLE_PAIRS           = 15;                                         /**< Hub motor pole pairs (30 magnets). */
-    static constexpr float METERS_PER_INCH              = 0.0254f;                                    /**< m per inch. */
-    static constexpr float PI_CONST                     = 3.14159265358979323846f;                    /**< Pi. */
-    static constexpr float WHEEL_DIAMETER_METERS        = WHEEL_DIAMETER_INCHES * METERS_PER_INCH;     /**< 0.254 m. */
-    static constexpr float WHEEL_CIRCUMFERENCE_METERS   = WHEEL_DIAMETER_METERS * PI_CONST;           /**< 0.798 m. */
 
     // Speeds
-    static constexpr float MPS_PER_MPH                  = 0.44704f;                                   /**< m/s per mph. */
     static constexpr float SPEED_STATIONARY_MPH         = 0.6f;                                       /**< Below this speed the vehicle counts as stationary (brake-to-start, arming). */
-    static constexpr float SPEED_STATIONARY_MPS         = SPEED_STATIONARY_MPH * MPS_PER_MPH;         /**< Same, in m/s. */
-    static constexpr float SPEED_STATIONARY_CMS         = SPEED_STATIONARY_MPS * 100.0f;              /**< Same, in cm/s. */
     static constexpr uint32_t SPEED_STATIONARY_ERPM     = 300;                                        /**< Same check on motor ERPM (about 0.6 mph with 15 pole pairs and a 10 in wheel). */
     static constexpr float MODE_1_SPEED_LIMIT_MPH       = 15.0f;                                      /**< Mode 1 speed limit. */
     static constexpr float MODE_2_SPEED_LIMIT_MPH       = 28.0f;                                      /**< Mode 2 speed limit. Mode 3 has none. */
@@ -96,7 +60,6 @@ namespace PowertrainConfig {
     // (set-current-rel), so 10000 counts means that limit. MOTOR_MAX_CURRENT_AMPS must match it.
     static constexpr float MOTOR_MAX_CURRENT_AMPS       = 120.0f;                                     /**< Motor current limit configured in VESC Tool, per motor. */
     static constexpr uint16_t THROTTLE_SCALE_MAX_COUNTS = 10000;                                      /**< Full-scale throttle and brake command. */
-    static constexpr float CURRENT_COUNTS_PER_AMP       = static_cast<float>(THROTTLE_SCALE_MAX_COUNTS) / MOTOR_MAX_CURRENT_AMPS; /**< 83.3 counts per A. */
     static constexpr float MODE_1_SCALE_RATIO           = 0.50f;                                      /**< Mode 1: 50 % of full current. */
     static constexpr float MODE_2_SCALE_RATIO           = 0.75f;                                      /**< Mode 2: 75 %. */
     static constexpr float MODE_3_SCALE_RATIO           = 1.00f;                                      /**< Mode 3: 100 %. */
@@ -110,15 +73,9 @@ namespace PowertrainConfig {
     // Regen fades in with speed (applied per wheel by the VESC script)
     static constexpr float SPEED_REGEN_MIN_MPH          = 5.0f;                                       /**< No regen below this speed; set from ride testing. */
     static constexpr float SPEED_REGEN_MAX_MPH          = 20.0f;                                      /**< Full regen (the selected PB level) above this speed. */
-    static constexpr float SPEED_REGEN_MIN_MPS          = SPEED_REGEN_MIN_MPH * MPS_PER_MPH;          /**< m/s. */
-    static constexpr float SPEED_REGEN_MAX_MPS          = SPEED_REGEN_MAX_MPH * MPS_PER_MPH;          /**< m/s. */
-    static constexpr float REGEN_LERP_RANGE_MPS         = SPEED_REGEN_MAX_MPS - SPEED_REGEN_MIN_MPS;  /**< m/s. */
-    static constexpr float INV_REGEN_RANGE_MPS          = 1.0f / REGEN_LERP_RANGE_MPS;                /**< 1 / range, in s/m. */
 
     // Timing. All link-loss timeouts are 500 ms, matching the timeout set in VESC Tool on both VESCs.
-    static constexpr uint32_t CONTROL_LOOP_RATE_HZ      = 50;                                         /**< Control frames per second to the VESC. */
-    static constexpr uint32_t VESC_TICK_RATE_HZ         = 50;                                         /**< Same as CONTROL_LOOP_RATE_HZ. */
-    static constexpr uint32_t VESC_TICK_INTERVAL_MS     = 20;                                         /**< Control frame period. */
+    static constexpr uint32_t VESC_TICK_INTERVAL_MS     = 20;                                         /**< Control frame period (50 frames per second). */
     static constexpr float VESC_TICK_INTERVAL_SEC       = 0.020f;                                     /**< Same, in s. */
     static constexpr uint32_t DEADMAN_MISSED_TICKS      = 25;                                         /**< VESC_DEADMAN_TIMEOUT_MS in control periods. */
     static constexpr uint32_t VESC_DROP_SINGLE_MS       = 32;                                         /**< Telemetry gap logged as one lost frame (verbose logging only). */
@@ -127,7 +84,6 @@ namespace PowertrainConfig {
     static constexpr uint32_t DISPLAY_DROP_STREAK_MS    = 320;                                        /**< Display gap logged as two or more lost frames. */
     static constexpr uint32_t VESC_DEADMAN_TIMEOUT_MS   = 500;                                        /**< The script cuts motor current when no control frame arrives for this long (same value in vesc/main.lbm). */
     static constexpr uint32_t VESC_COMMS_TIMEOUT_MS     = 500;                                        /**< The ESP32 treats the VESC as offline after this long without telemetry. */
-    static constexpr uint32_t DISPLAY_DEADMAN_TIMEOUT_MS= 500;                                        /**< Display stall timeout (the display library uses its own default of the same value). */
     static constexpr uint32_t FAULT_CYCLE_PERIOD_MS     = 1000;                                       /**< With two faults active, the display alternates between them at this period. */
     static constexpr uint32_t B2S_HOLD_REQUIRED_MS      = 200;                                        /**< Brake hold time needed to arm. */
 
@@ -143,35 +99,9 @@ namespace PowertrainConfig {
     static constexpr float MAX_SLEW_DT_SEC              = 0.100f;                                     /**< s; a longer gap cannot release a large step at once. */
     static constexpr float THROTTLE_SNAP_EPSILON        = 1.0f;                                       /**< Snap to the target when within 1 count. */
 
-    // Helpers
     inline constexpr float cms_to_mph(int16_t cms) {
         return static_cast<float>(cms) * (0.01f * 2.23693629f);
     }
-    inline constexpr int16_t mph_to_cms(float mph) {
-        return static_cast<int16_t>(roundf(mph * (0.44704f * 100.0f)));
-    }
-    inline constexpr float kmh_to_mph(float kmh) {
-        return kmh * 0.62137119f;
-    }
-    inline constexpr float mph_to_kmh(float mph) {
-        return mph * 1.609344f;
-    }
-    inline constexpr bool is_elapsed(uint32_t now, uint32_t start, uint32_t duration) {
-        return (now - start) >= duration;
-    }
-    inline constexpr uint16_t get_mode_max_counts(uint8_t gear) {
-        return (gear == 1) ? MODE_1_MAX_COUNTS :
-               (gear == 2) ? MODE_2_MAX_COUNTS : MODE_3_MAX_COUNTS;
-    }
-
-    // Older names
-    static constexpr float MAX_MOTOR_CURRENT_A          = MOTOR_MAX_CURRENT_AMPS;
-    static constexpr float THROTTLE_FULL_SCALE          = static_cast<float>(THROTTLE_SCALE_MAX_COUNTS);
-    static constexpr float COUNTS_PER_AMP               = CURRENT_COUNTS_PER_AMP;
-    static constexpr float CONTROL_LOOP_HZ              = static_cast<float>(CONTROL_LOOP_RATE_HZ);
-    static constexpr float TICK_DT_S                    = VESC_TICK_INTERVAL_SEC;
-    static constexpr float STATIONARY_SPEED_MPH         = SPEED_STATIONARY_MPH;
-    static constexpr uint16_t CURRENT_DEADBAND_COUNTS   = THROTTLE_DEADBAND_COUNTS;
 }
 
 /**
@@ -184,10 +114,6 @@ struct SlewConfig {
         if (pa_level < 1) pa_level = 1;
         if (pa_level > 5) pa_level = 5;
         return static_cast<float>(pa_level) * PowertrainConfig::SLEW_COUNTS_PER_SEC_PER_PA;
-    }
-
-    static constexpr float get_max_step_per_tick(uint8_t pa_level) {
-        return get_units_per_sec(pa_level) * PowertrainConfig::VESC_TICK_INTERVAL_SEC;
     }
 };
 
