@@ -21,6 +21,7 @@ ESP32-WROVER firmware that sits between the Kukirin G3 Pro display (TFM13-FEIMI-
 - Build: `pio run`
 - LispBM bracket check: `python tools/check_lisp_parens.py`
 - ESP32 and LispBM constants agree: `python tools/check_shared_constants.py`
+- Project rules (forbidden calls, log format, doc style, secrets): `python tools/lint_invariants.py`
 - Compare two firmware builds: `python tools/compare_firmware.py --ignore-build-time A.elf B.elf`
 
 ## Rules
