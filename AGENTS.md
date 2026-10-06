@@ -14,11 +14,13 @@ ESP32-WROVER firmware that sits between the Kukirin G3 Pro display (TFM13-FEIMI-
 - `lib/BTAudio/`: planned feature, not built into the firmware.
 - `vesc/main.lbm`: LispBM powertrain script for the rear VESC.
 - `tools/`: checks and helper scripts.
+- `test/`: native unit tests (Unity).
 - `third_party/`: pinned upstream sources (VESC firmware, VESC Tool, LispBM, Junk495's G2 Pro work). Read-only reference; never edit.
 
 ## Commands
 
 - Build: `pio run`
+- Unit tests on the PC: `pio test -e native` (needs a host gcc on PATH; libraries run unchanged against the stand-ins in test/support)
 - LispBM bracket check: `python tools/check_lisp_parens.py`
 - ESP32 and LispBM constants agree: `python tools/check_shared_constants.py`
 - Project rules (forbidden calls, log format, doc style, secrets): `python tools/lint_invariants.py`
