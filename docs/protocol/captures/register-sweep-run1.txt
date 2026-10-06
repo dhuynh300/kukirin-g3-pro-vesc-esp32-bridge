@@ -1,0 +1,115 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- Record the screen result (e.g. Normal, E6, E1, E3, E5, E7, E9, E11, E13, E17, Brake icon, etc.).
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+"single only" or "dual only" means that the display is rejecting packet and won't switch due to E6
+
+[01] Byte[0x00] Start = 0x01                -> Result: E6 single only
+[02] Byte[0x00] Start = 0x03                -> Result: E6 single only
+[03] Byte[0x00] Start = 0x55                -> Result: E6 single only
+
+[04] Byte[0x01] Length = 0x0D (13)          -> Result: E6 single only
+[05] Byte[0x01] Length = 0x0F (15)          -> Result: E6 single only
+[06] Byte[0x01] Length = 0x14 (20)          -> Result: E6 single only
+
+[07] Byte[0x02] Type = 0x00                 -> Result: E6 single only
+[08] Byte[0x02] Type = 0x03                 -> Result: E6 single only
+[09] Byte[0x02] Type = 0x04                 -> Result: E6 single only
+[10] Byte[0x02] Type = 0x08                 -> Result: E6 single only
+[11] Byte[0x02] Type = 0x10                 -> Result: E6 single only
+
+[12] Byte[0x03] Flag = 0x01 (Add)           -> Result: Normal dual/single
+[13] Byte[0x03] Flag = 0x02 (Add)           -> Result: Normal dual/single
+[14] Byte[0x03] Flag = 0x03 (Add)           -> Result: Normal dual/single
+[15] Byte[0x03] Flag = 0x04 (Add)           -> Result: E6 dual only
+[16] Byte[0x03] Flag = 0x05 (Add)           -> Result: E6 dual only
+[17] Byte[0x03] Flag = 0x07 (Add)           -> Result: E6 dual only
+[18] Byte[0x03] Flag = 0x09 (Add)           -> Result: E6 dual only
+[19] Byte[0x03] Flag = 0x0B (11 Add)        -> Result: E6 dual only
+[20] Byte[0x03] Flag = 0x0D (13 Add)        -> Result: E6 dual only
+[21] Byte[0x03] Flag = 0x11 (17 Add)        -> Result: E3 dual/single
+[22] Byte[0x03] Flag = 0x01 (Sub)           -> Result: E3/E6 single only (could it be similar to stuck D/S where display only remembers last valid packet and ignores any new updates to E6? we should test that)
+[23] Byte[0x03] Flag = 0x03 (Sub)           -> Result: E3/E6 single only
+[24] Byte[0x03] Flag = 0x05 (Sub)           -> Result: E3/E6 single only (actually, when commanding "idle->j 24" it's now only E6 stuck in dual! so it does only remember last valid packet/state/error!)
+
+[25] Byte[0x04] Status = 0xC1 (E9 Solid)    -> Result: E9, but when esp32 says i've toggled to dual E6 shows up a few seconds later and it flickers E9/E6. still stuck in single (or last motor mode?)
+[26] Byte[0x04] Status = 0xC2 (Bit 1)       -> Result: Normal in single, but when esp32 says dual E6 (display still only says single, doesn't change to dual, same with last test)
+[27] Byte[0x04] Status = 0xC3 (Bits 0+1)    -> Result: Same as #25
+[28] Byte[0x04] Status = 0xC4 (Bit 2)       -> Result: E9/E6, stuck on single
+[29] Byte[0x04] Status = 0xC5 (Bits 0+2)    -> Result: Same as #28
+[30] Byte[0x04] Status = 0xC7 (Bits 0+1+2)  -> Result: Same as #28
+[31] Byte[0x04] Status = 0xCD (Bits 0+2+3)  -> Result: Same as #28 (it's doing the thing saving last known packet/state error code, so it can be treated as "E6 instead of mixed command". The theory that it can display two errors at a time is not 100% correct, it shows last state before E6 which includes any errors)
+[32] Byte[0x04] Status = 0xD0 (E7 Solid)    -> Result: E7 single, E6/E7 dual (esp32 only, display stuck on single/last valid mode verified by "idle->j 32 in dual mode")
+[33] Byte[0x04] Status = 0xD1 (E7<->E9)     -> Result: In single E7/E9, in dual E7/E6/E9 (so dual mode causes E6 from "idle->j 33" and the 3 error codes at a time is caused by the last valid state which is combined E7/E9 + E6 rejection behavior)
+[34] Byte[0x04] Status = 0xD2 (Bits 4+1)    -> Result: Same as #32
+[35] Byte[0x04] Status = 0xD4 (Bits 4+2)    -> Result: E6 stuck in last mode
+[36] Byte[0x04] Status = 0xE0 (Brake Sub)   -> Result: Normal single, E6 on dual (engaging brakes does nothing in either mode)
+
+[37] Byte[0x05] Slave = 0x01 (Bit 0)        -> Result: Normal D/S
+[38] Byte[0x05] Slave = 0x02 (Bit 1)        -> Result: Normal D/S
+[39] Byte[0x05] Slave = 0x03 (Bits 0+1)     -> Result: Normal D/S
+[40] Byte[0x05] Slave = 0x04 (Bit 2)        -> Result: E6 (im just going to say E6 which means "E6, mode is stuck on last valid mode")
+[41] Byte[0x05] Slave = 0x05 (Bits 0+2)     -> Result: E6
+[42] Byte[0x05] Slave = 0x08 (Bit 3)        -> Result: E6
+[43] Byte[0x05] Slave = 0x0B (11 Dec)       -> Result: E6
+[44] Byte[0x05] Slave = 0x0D (13 Dec)       -> Result: E6
+[45] Byte[0x05] Slave = 0x10 (E13 Solid)    -> Result: E13 D/S
+[46] Byte[0x05] Slave = 0x11 (Bits 4+0)     -> Result: E13 D/S
+[47] Byte[0x05] Slave = 0x12 (Bits 4+1)     -> Result: E13 D/S
+[48] Byte[0x05] Slave = 0x20 (Bit 5)        -> Result: E6
+[49] Byte[0x05] Slave = 0x40 (Bit 6)        -> Result: E6
+[50] Byte[0x05] Slave = 0x80 (Bit 7)        -> Result: E6
+
+[51] Byte[0x06] Link = 0x01 (Bit 0)         -> Result: Normal single, E6 dual
+[52] Byte[0x06] Link = 0x02 (Bit 1)         -> Result: Same as #51
+[53] Byte[0x06] Link = 0x04 (Bit 2)         -> Result: E6
+[54] Byte[0x06] Link = 0x10 (E17 Solid)     -> Result: E17 single, E6 dual
+[55] Byte[0x06] Link = 0x11 (Bits 4+0)      -> Result: Same as #54
+[56] Byte[0x06] Link = 0x20 (Bit 5)         -> Result: E6
+[57] Byte[0x06] Link = 0x40 (Bit 6)         -> Result: E6
+[58] Byte[0x06] Link = 0x80 (Bit 7)         -> Result: E6
+
+[59] Byte[0x07] Speed2 = 0x01               -> Result: Normal D/S
+[60] Byte[0x07] Speed2 = 0x02               -> Result: Normal D/S
+[61] Byte[0x07] Speed2 = 0x04               -> Result: E6
+[62] Byte[0x07] Speed2 = 0x08               -> Result: E6
+[63] Byte[0x07] Speed2 = 0x10               -> Result: Normal D/S
+[64] Byte[0x07] Speed2 = 0x20               -> Result: E6
+
+[65] Byte[0x0A] Current0 = 0x01             -> Result: Normal D/S
+[66] Byte[0x0A] Current0 = 0x02             -> Result: Normal D/S
+[67] Byte[0x0A] Current0 = 0x04             -> Result: E6
+[68] Byte[0x0A] Current0 = 0x08             -> Result: E6
+[69] Byte[0x0A] Current0 = 0x10             -> Result: Normal D/S
+[70] Byte[0x0A] Current0 = 0x20             -> Result: E6
+
+[71] Byte[0x0B] Current1 = 0x01             -> Result: Normal D/S
+[72] Byte[0x0B] Current1 = 0x02             -> Result: Normal D/S
+[73] Byte[0x0B] Current1 = 0x04             -> Result: E6
+[74] Byte[0x0B] Current1 = 0x10             -> Result: Normal D/S
+[75] Byte[0x0B] Current1 = 0x20             -> Result: E6
+
+[76] Byte[0x0D] Unknown = 0x01              -> Result: Normal D/S
+[77] Byte[0x0D] Unknown = 0x02              -> Result: Normal D/S
+[78] Byte[0x0D] Unknown = 0x04              -> Result: E6
+[79] Byte[0x0D] Unknown = 0x08              -> Result: E6
+[80] Byte[0x0D] Unknown = 0x10              -> Result: Normal D/S
+
+[81] Byte[0x0E] Echo = 0x01 (Len 20)        -> Result: Normal D/S
+[82] Byte[0x0F] Echo = 0x14 (Len 20)        -> Result: Normal D/S
+[83] Byte[0x0E] Echo = 0x00                 -> Result: Normal D/S
+[84] Byte[0x0F] Echo = 0x00                 -> Result: Normal D/S
+
+[85] Cruising 11mph + Byte[0x04]=0xC1       -> Result: E6
+[86] Cruising 11mph + Byte[0x04]=0xD0       -> Result: E6
+[87] Cruising 11mph + Byte[0x05]=0x10       -> Result: E6
+[88] Cruising 11mph + Byte[0x06]=0x10       -> Result: E6
+================================================================================
+
+Could it be that for some of the E6 errors, it's due to a bad checksum which in turn is hiding other errors we haven't found yet? we'd have to retest the E6 errors again if so!
+Make sure none of the errors were caused by bad broken buggy code!

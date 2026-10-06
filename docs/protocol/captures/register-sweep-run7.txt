@@ -1,0 +1,59 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG - RUN 7 (28 TESTS)
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- Record the exact screen result (e.g. E13, E4, Normal DS, E0, etc.).
+- Tests 1 to 22 are sequenced for ZERO/LOW latching risk (no power cycles needed).
+- Batch 5 (Tests 23 to 28) probes E31/E-00 latching and UART recovery methods.
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+--------------------------------------------------------------------------------
+BATCH 1: Slave Error Single Mode Independence (Tests 1-4) [Zero Risk]
+--------------------------------------------------------------------------------
+[01] [Single] Byte 0x05 = 0x10 Slave Error in Single   -> Result: E13 DS
+[02] [Single] Byte 0x05 = 0x08 Slave Diag 15 in Single -> Result: E15 DS
+[03] [Single] Byte 0x05 = 0x40 Front Hall in Single    -> Result: E11 DS
+[04] [Single] Byte 0x06 = 0x10 Sub Link in Single      -> Result: E17 DS
+
+--------------------------------------------------------------------------------
+BATCH 2: Hunting In-Between Master Codes (E4, E8) (Tests 5-10) [Zero Risk]
+--------------------------------------------------------------------------------
+[05] [Master] Byte 0x03 Bit 2 (0x04 -> Target E04)     -> Result: Normal DS
+[06] [Master] Byte 0x03 Bit 1 (0x02 -> Target E04/E08) -> Result: Normal DS
+[07] [Master] Byte 0x03 Bit 0 (0x01 -> Target E04/E08) -> Result: Normal DS
+[08] [Status] Byte 0x04 Bit 1 (0xC2 -> Target E08)     -> Result: Normal DS
+[09] [Status] Byte 0x04 Bit 2 (0xC4 -> Target E08)     -> Result: Normal DS
+[10] [Status] Byte 0x04 Bit 3 (0xC8 -> Target E08)     -> Result: Normal DS
+
+--------------------------------------------------------------------------------
+BATCH 3: Hunting In-Between Slave Codes (E10, E12, E14, E16, E18, E20) (Tests 11-18) [Zero Risk]
+--------------------------------------------------------------------------------
+[11] [Slave] Byte 0x05 Bit 2 (0x04 -> Target E14)      -> Result: Normal D
+[12] [Slave] Byte 0x05 Bit 1 (0x02 -> Target E12)      -> Result: Normal D
+[13] [Slave] Byte 0x05 Bit 0 (0x01 -> Target E10)      -> Result: Normal D
+[14] [Link]  Byte 0x06 Bit 0 (0x01 -> Target E18/E20)  -> Result: Normal D
+[15] [Link]  Byte 0x06 Bit 1 (0x02 -> Target E18/E20)  -> Result: Normal D
+[16] [Link]  Byte 0x06 Bit 2 (0x04 -> Target E18/E20)  -> Result: Normal D
+[17] [Link]  Byte 0x06 Bit 3 (0x08 -> Target E16)      -> Result: Normal D
+[18] [Link]  Byte 0x06 Bit 5 (0x20 -> Target E18/E21)  -> Result: Normal D
+
+--------------------------------------------------------------------------------
+BATCH 4: Intra-Byte Multi-Fault Combinations (Tests 19-22) [Low Risk]
+--------------------------------------------------------------------------------
+[19] [Combo] Byte 0x03 = 0x48 (Master E01 + E05)       -> Result: E1/E5 DS
+[20] [Combo] Byte 0x03 = 0x30 (Master E02 + E03)       -> Result: E2/E3 DS
+[21] [Combo] Byte 0x05 = 0x48 (Slave E11 + E15)        -> Result: E11/E15 D
+[22] [Combo] Byte 0x05 = 0x18 (Slave E13 + E15)        -> Result: E13/E15 D
+
+--------------------------------------------------------------------------------
+BATCH 5: E-00 Latching & UART Recovery Probing (Tests 23-28) [High Risk - Run Last]
+--------------------------------------------------------------------------------
+[23] [Latch] Byte 0x05 = 0x20 (Trigger E31 / Latched E0) -> Result: E31->E0 D
+[24] [Recovery] Probe 1: Send 0x80 Handshake Frame     -> Result: Normal DS
+[25] [Recovery] Probe 2: Send Dynamic 10mph Speed Pulse -> Result: Normal DS
+[26] [Recovery] Probe 3: Send Alt Frame Type 0x02      -> Result: Normal (cant switch modes, stuck on last valid mode)
+[27] [Recovery] Probe 4: Send Clean All-Zero Payload   -> Result: Normal (cant switch modes, stuck on last valid mode)
+[28] [Collision] Byte 0x05 = 0x60 (Front Hall E11 + E31) -> Result: E11 D
+================================================================================

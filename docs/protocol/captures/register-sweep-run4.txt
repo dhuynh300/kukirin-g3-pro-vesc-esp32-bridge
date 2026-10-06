@@ -1,0 +1,24 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG - RUN 4
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- For Sweeps (Tests 1-3), wait and watch the terminal. The ESP32 will print the sweep progress [0 to 255]. Observe if the battery bar, voltage, or any icons animate on the dashboard.
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+--------------------------------------------------------------------------------
+BATCH 1: Analog Sweeps (Discovering UI / Telemetry / Hidden Errors)
+--------------------------------------------------------------------------------
+[01] [Sweep 0-255] Byte 0x07 (Unknown 1) -> Result: Normal, no changes
+[02] [Sweep 0-255] Byte 0x0A (Telemetry 1) -> Result: Normal, no changes
+[03] [Sweep 0-255] Byte 0x0B (Telemetry 2) -> Result: Normal, no changes
+
+--------------------------------------------------------------------------------
+BATCH 2: Precision Speed Control (Using C++ encodeSpeedRawMph)
+--------------------------------------------------------------------------------
+[04] [Speed] 10 mph                      -> Result: E6
+[05] [Speed] 25 mph                      -> Result: E6
+[06] [Speed] 45 mph                      -> Result: E6
+[07] [Speed] 60 mph                      -> Result: E6
+================================================================================

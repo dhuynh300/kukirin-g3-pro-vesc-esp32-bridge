@@ -1,0 +1,87 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG - ULTIMATE TEST SUITE
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- Record the screen result (e.g. Normal, E1, E3, Brake, Animating, etc.).
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+--------------------------------------------------------------------------------
+BATCH 1: Byte 0x03 (Master Fault Flags) - Baseline 0x00
+--------------------------------------------------------------------------------
+[01] [Byte 0x03] Bit 0 (0x01)            -> Result: Normal
+[02] [Byte 0x03] Bit 1 (0x02)            -> Result: Normal
+[03] [Byte 0x03] Bit 2 (0x04)            -> Result: Normal
+[04] [Byte 0x03] Bit 3 (0x08)            -> Result: E5 DS
+[05] [Byte 0x03] Bit 4 (0x10) E3         -> Result: E3 DS
+[06] [Byte 0x03] Bit 5 (0x20)            -> Result: E2 DS
+[07] [Byte 0x03] Bit 6 (0x40)            -> Result: E1 DS
+[08] [Byte 0x03] Bits 0+1+2 (0x07) Hall? -> Result: Normal
+
+--------------------------------------------------------------------------------
+BATCH 2: Byte 0x04 (System Status) - Baseline 0xC0
+--------------------------------------------------------------------------------
+[09] [Byte 0x04] Bit 0 (0xC1) E9         -> Result: E9 DS
+[10] [Byte 0x04] Bit 1 (0xC2)            -> Result: Normal
+[11] [Byte 0x04] Bit 2 (0xC4)            -> Result: Normal
+[12] [Byte 0x04] Bit 4 (0xD0) E7         -> Result: E7 DS
+[13] [Byte 0x04] Bit 5 OFF (0x80)        -> Result: Normal
+[14] [Byte 0x04] Bit 6 OFF (0x40)        -> Result: Normal
+[15] [Byte 0x04] Brake Icon (0xE0)       -> Result: Normal
+
+--------------------------------------------------------------------------------
+BATCH 3: Byte 0x05 (Slave Fault Flags) - Baseline 0x00
+--------------------------------------------------------------------------------
+[16] [Byte 0x05] Bit 0 (0x01)            -> Result: Normal
+[17] [Byte 0x05] Bit 1 (0x02)            -> Result: Normal
+[18] [Byte 0x05] Bit 2 (0x04)            -> Result: Normal
+[19] [Byte 0x05] Bit 3 (0x08)            -> Result: E15 DS
+[20] [Byte 0x05] Bit 4 (0x10) E13        -> Result: E13 DS
+[21] [Byte 0x05] Bit 5 (0x20)            -> Result: E0 DS
+[22] [Byte 0x05] Bit 6 (0x40)            -> Result: E0 DS
+[23] [Byte 0x05] Bits 0+1+2 (0x07) Hall? -> Result: Normal
+
+--------------------------------------------------------------------------------
+BATCH 4: Byte 0x06 (Link Status) - Baseline 0x00
+--------------------------------------------------------------------------------
+[24] [Byte 0x06] Bit 0 (0x01)            -> Result: Normal
+[25] [Byte 0x06] Bit 1 (0x02)            -> Result: Normal
+[26] [Byte 0x06] Bit 2 (0x04)            -> Result: Normal
+[27] [Byte 0x06] Bit 4 (0x10) E17        -> Result: E0 DS
+[28] [Byte 0x06] Bit 5 (0x20)            -> Result: Normal
+[29] [Byte 0x06] Bit 6 (0x40)            -> Result: Normal
+
+--------------------------------------------------------------------------------
+BATCH 5: Analog Sweeps (Discovering UI / Telemetry)
+--------------------------------------------------------------------------------
+[30] [Sweep 0-255] Byte 0x07 (Unknown 1) -> Result: SKIP
+[31] [Sweep 0-255] Byte 0x0A (Telemetry 1) -> Result: SKIP
+[32] [Sweep 0-255] Byte 0x0B (Telemetry 2) -> Result: SKIP
+
+--------------------------------------------------------------------------------
+BATCH 6: Priority Combinations (Error Masking)
+--------------------------------------------------------------------------------
+[33] [Combo] Master E3 + Slave E13       -> Result: E0 DS
+[34] [Combo] E9 Over-temp + E7 Comm      -> Result: E0 DS
+
+--------------------------------------------------------------------------------
+BATCH 7: Dynamic Motion (11 mph, speedRaw=154)
+--------------------------------------------------------------------------------
+[35] [Dynamic 11mph] Normal              -> Result: Normal
+[36] [Dynamic 11mph] E3 (0x03=0x10)      -> Result: E0 DS
+[37] [Dynamic 11mph] E9 (0x04=0xC1)      -> Result: E0 DS
+[38] [Dynamic 11mph] E13 (0x05=0x10)     -> Result: E0 DS
+[39] [Dynamic 11mph] E17 (0x06=0x10)     -> Result: E0 DS
+
+--------------------------------------------------------------------------------
+BATCH 8: Dynamic Braking & PB Speed Gates
+--------------------------------------------------------------------------------
+[40] [Brake 0mph] Single (0x04=0xE0)     -> Result: Normal
+[41] [Brake 0mph] Dual (0x04=0xE0)       -> Result: Normal
+[42] [Brake 11mph] Single (0x04=0xE0)    -> Result: Normal
+[43] [Brake 11mph] Dual (0x04=0xE0)      -> Result: Normal
+[44] [Brake 60mph] Single (0x04=0xE0)    -> Result: Normal, 63mph
+[45] [Brake 60mph] Dual (0x04=0xE0)      -> Result: Normal, 63mph
+Look at the speedometer conversion formulas we have found earlier to make sure this is correct, or do we have to reverse engineer it again?
+================================================================================

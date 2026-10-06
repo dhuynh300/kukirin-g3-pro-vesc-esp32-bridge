@@ -1,0 +1,71 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG - RUN 6 (36 TESTS)
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- Record the exact screen result (e.g. 10 mph, E1, E2, E3, Brake icon, Normal, etc.).
+- Tests 1 to 32 are sequenced for ZERO/LOW latching risk (no power cycles needed).
+- Batch 6 (Tests 33 to 36) probes E-00 latching and should be run last.
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+--------------------------------------------------------------------------------
+BATCH 1: Telemetry & Calibrated Speed Gates (Tests 1-6) [Zero Risk]
+--------------------------------------------------------------------------------
+[01] [Speed] 0 mph Baseline Idle (Single)              -> Result: Normal DS
+[02] [Mode] Dual Drive Indicator (0xC8 / 0x08)         -> Result: Normal D
+[03] [Speed] 10 mph Low-Speed Gate                     -> Result: Normal DS
+[04] [Speed] 25 mph Mid-Speed Gate                     -> Result: Normal DS
+[05] [Speed] 45 mph High-Speed Dual Gate               -> Result: Normal D
+[06] [Speed] 60 mph Top-Speed Dual Gate                -> Result: Normal D 61
+
+--------------------------------------------------------------------------------
+BATCH 2: Brake & Frame Type Bit Probing (Tests 7-11) [Zero/Low Risk]
+--------------------------------------------------------------------------------
+[07] [Brake] Stationary Brake Icon (0xE0)              -> Result: Normal DS
+[08] [Brake] Dynamic 25mph Brake Icon (0xE8)           -> Result: Normal D
+[09] [Frame] Byte 0x02 = 0x02 (Trip Odometer)          -> Result: Normal D
+[10] [Frame] Byte 0x02 = 0x04 (Diagnostic Type)        -> Result: Normal D
+[11] [Frame] Byte 0x02 = 0x20 (Target E32/Ext)         -> Result: Normal D
+
+--------------------------------------------------------------------------------
+BATCH 3: Ground-Truth Error Re-affirmation (Tests 12-21) [Zero Risk]
+--------------------------------------------------------------------------------
+[12] [Error] Master Rear Hall (Byte 0x03=0x40 -> E01)  -> Result: E1 DS
+[13] [Error] Master Diag 2 (Byte 0x03=0x20 -> E02)     -> Result: E2 DS
+[14] [Error] Master Failure (Byte 0x03=0x10 -> E03)    -> Result: E3 DS
+[15] [Error] Master Voltage (Byte 0x03=0x08 -> E05)    -> Result: E5 DS
+[16] [Error] Master Over-Temp (Byte 0x04=0xC1 -> E09)  -> Result: E9 DS
+[17] [Error] Master Sending (Byte 0x04=0xD0 -> E07)    -> Result: E7 DS
+[18] [Error] Secondary Controller (Byte 0x05=0x10 -> E13) -> Result: E13 D
+[19] [Error] Secondary Diag 15 (Byte 0x05=0x08 -> E15) -> Result: E15 D
+[20] [Error] Front Motor Hall (Byte 0x05=0x40 -> E11)  -> Result: E11 D
+[21] [Error] Sub-Controller Link (Byte 0x06=0x10 -> E17) -> Result: E17 S
+
+--------------------------------------------------------------------------------
+BATCH 4: Mode Dependencies & Multi-Fault Cycling (Tests 22-24) [Low Risk]
+--------------------------------------------------------------------------------
+[22] [Multi] Byte 0x04 = 0xD1 (E07 <-> E09 Cycle)      -> Result: E7/E9 DS
+[23] [Gating] Byte 0x05=0x40 Front Hall in Single      -> Result: E11 DS
+[24] [Gating] Byte 0x06=0x10 Sub Link in Single        -> Result: E17 DS
+
+--------------------------------------------------------------------------------
+BATCH 5: Systematic Bit-Walk for Undocumented Codes (Tests 25-32)
+--------------------------------------------------------------------------------
+[25] [BitWalk] Byte 0x04 Bit 1 (0xC2 -> Target E08)    -> Result: Normal DS
+[26] [BitWalk] Byte 0x04 Bit 2 (0xC4 -> Target E08)    -> Result: Normal DS
+[27] [BitWalk] Byte 0x03 Bits 0+1+2 (0x07 -> Target E04/E08) -> Result: Normal DS
+[28] [BitWalk] Byte 0x05 Bits 0+1+2 (0x07 -> Target E14)     -> Result: Normal DS
+[29] [BitWalk] Byte 0x05 Bit 5 (0x20 -> Target E16)    -> Result: E31 for a second then solid E0
+[30] [BitWalk] Byte 0x06 Bit 3 (0x08 -> Target E16)    -> Result: Normal D
+[31] [BitWalk] Byte 0x06 Bit 5 (0x20 -> Target E18/E21) -> Result: Normal D
+[32] [BitWalk] Byte 0x06 Bit 6 (0x40 -> Target E21/E32) -> Result: Normal D
+
+--------------------------------------------------------------------------------
+BATCH 6: Motion Suppression & Collision Latching (Tests 33-36) [High Risk - Run Last]
+--------------------------------------------------------------------------------
+[33] [Motion] 25mph + Byte 0x03=0x10 Master Error      -> Result: E3 DS
+[34] [Motion] 25mph + Byte 0x04=0xC1 Over-Temp         -> Result: E9 DS
+[35] [Motion] 25mph + Byte 0x05=0x40 Front Hall (Dual) -> Result: E11 D
+[36] [Collision] Dual Collision (Master E03 + Slave E13) -> Result: E3/E13 D
+================================================================================

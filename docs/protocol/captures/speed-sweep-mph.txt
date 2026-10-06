@@ -1,0 +1,4 @@
+P3 = 80, P4 = 1, absent speedRaw values means 0 error
+speedRaw, (actual - expected) error
+
+tested from 1-1352 (1352-3500 is just 0 for both actual and expected mph)

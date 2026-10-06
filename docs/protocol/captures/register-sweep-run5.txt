@@ -1,0 +1,40 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG - RUN 5 (14 TESTS)
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- Record the exact screen result (e.g. 10 mph, E11, E17, Brake icon, Normal, etc.).
+- Note: If an unmapped test triggers E-00, power-cycle the display before proceeding.
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+--------------------------------------------------------------------------------
+BATCH 1: Precision Speed Gates (Pure Baseline, Dyadic 1764 Formula)
+--------------------------------------------------------------------------------
+[01] [Speed] 10 mph (Single)                      -> Result: 10
+[02] [Speed] 25 mph (Single)                      -> Result: 25
+[03] [Speed] 45 mph (Dual)                        -> Result: 45
+[04] [Speed] 60 mph (Dual)                        -> Result: 61
+[05] [Speed] 0 mph (Idle Baseline)                -> Result: 0
+
+--------------------------------------------------------------------------------
+BATCH 2: Dual-Gated Secondary Motor Faults (Hypothesis: E11 & E17)
+--------------------------------------------------------------------------------
+[06] [Dual] Byte 0x05 Bit 6 (0x40) Front Hall?    -> Result: E11
+[07] [Dual] Byte 0x05 Bit 5 (0x20) Slave Unk?     -> Result: E0 (A random error code is first flashed then switches to E0)
+[08] [Dual] Byte 0x05 Bit 7 (0x80) Slave Bit 7    -> Result: Normal
+[09] [Dual] Byte 0x06 Bit 4 (0x10) E17 Link?      -> Result: E17
+[10] [Dual] Byte 0x06 Bit 7 (0x80) Link Bit 7     -> Result: Normal
+
+--------------------------------------------------------------------------------
+BATCH 3: Untested Bit 7 Master & Status Resets
+--------------------------------------------------------------------------------
+[11] [Single] Byte 0x03 Bit 7 (0x80) Master Bit 7 -> Result: Normal DS
+[12] [Single] Byte 0x04 Bit 7 (0x80) Sys Bit 7    -> Result: Normal DS
+
+--------------------------------------------------------------------------------
+BATCH 4: Braking & Dynamic Interlocks
+--------------------------------------------------------------------------------
+[13] [Brake] Stationary Brake (Byte 0x04 = 0xE0)  -> Result: Normal DS
+[14] [Brake] Dynamic 25mph Brake (0xE0 + 25mph)   -> Result: Normal
+================================================================================

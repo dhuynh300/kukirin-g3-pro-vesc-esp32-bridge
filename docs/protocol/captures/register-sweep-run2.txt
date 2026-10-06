@@ -1,0 +1,95 @@
+================================================================================
+KUKIRIN G3 PRO REGISTER STEPPER TEST OBSERVATIONS LOG - RUN 2 (60 TESTS)
+================================================================================
+Instructions:
+- Step through tests using SPACE or 'n' in your serial terminal (115200 baud).
+- Record the screen result (e.g. Normal, E6, E1, E3, E5, E7, E9, E11, E13, E17, Brake icon, etc.).
+- When finished, copy/paste this file back into the chat.
+================================================================================
+
+--------------------------------------------------------------------------------
+BATCH 1: Byte[0x03] Stationary System Diagnostics (0 RPM, speedRaw = 3500)
+--------------------------------------------------------------------------------
+[01] Byte[0x03] Static Flag = 0x10 (Bit 4 E3 Conf) -> Result: E3 D/S
+[02] Byte[0x03] Static Flag = 0x01 (Hall 1?)       -> Result: Normal D/S
+[03] Byte[0x03] Static Flag = 0x02 (Hall 2?)       -> Result: Normal D/S
+[04] Byte[0x03] Static Flag = 0x04 (Hall 3?)       -> Result: E6, periodic normal
+[05] Byte[0x03] Static Flag = 0x07 (Hall Inv 111?) -> Result: E6, periodic normal
+[06] Byte[0x03] Static Flag = 0x11 (E3 Verified)   -> Result: E3 D/S
+[07] Byte[0x03] Static Flag = 0x12 (Bits 4+1)      -> Result: E3 D/S
+[08] Byte[0x03] Static Flag = 0x14 (Bits 4+2)      -> Result: E6, periodic normal
+[09] Byte[0x03] Static Flag = 0x17 (Bits 4+2+1+0)  -> Result: E6, periodic normal
+[10] Byte[0x03] Static Flag = 0x18 (Bits 4+3)      -> Result: E6, periodic normal
+[11] Byte[0x03] Static Flag = 0x20 (Bit 5)         -> Result: E6, periodic normal
+[12] Byte[0x03] Static Flag = 0x21 (Bits 5+0)      -> Result: E6, periodic normal
+[13] Byte[0x03] Static Flag = 0x22 (Bits 5+1)      -> Result: E6, periodic normal
+[14] Byte[0x03] Static Flag = 0x30 (Bits 5+4)      -> Result: E6, periodic normal
+
+--------------------------------------------------------------------------------
+BATCH 2: Byte[0x05] Stationary Slave Diagnostics (0 RPM, speedRaw = 3500)
+--------------------------------------------------------------------------------
+[15] Byte[0x05] Static Slave = 0x10 (E13 Verified)-> Result: E13 D/S
+[16] Byte[0x05] Static Slave = 0x01 (Hall 1?)     -> Result: Normal D/S
+[17] Byte[0x05] Static Slave = 0x02 (Hall 2?)     -> Result: Normal D/S
+[18] Byte[0x05] Static Slave = 0x04 (Hall 3?)     -> Result: E6
+[19] Byte[0x05] Static Slave = 0x07 (Hall Inv 111?)-> Result: E6
+[20] Byte[0x05] Static Slave = 0x11 (Bits 4+0)    -> Result: E13 D/S
+[21] Byte[0x05] Static Slave = 0x12 (Bits 4+1)    -> Result: E13 D/S
+[22] Byte[0x05] Static Slave = 0x14 (Bits 4+2)    -> Result: E6
+[23] Byte[0x05] Static Slave = 0x20 (Bit 5)       -> Result: E6
+[24] Byte[0x05] Static Slave = 0x21 (Bits 5+0)    -> Result: E6
+
+--------------------------------------------------------------------------------
+BATCH 3: Byte[0x04] Master System Status (0 RPM, speedRaw = 3500)
+--------------------------------------------------------------------------------
+[25] Byte[0x04] Static Status = 0xC1 (E9 Solid)   -> Result: E9 D/S
+[26] Byte[0x04] Static Status = 0xC2 (Bit 1)      -> Result: Normal D/S
+[27] Byte[0x04] Static Status = 0xC3 (Bits 0+1)   -> Result: E9 D/S
+[28] Byte[0x04] Static Status = 0xC4 (Bit 2)      -> Result: E6
+[29] Byte[0x04] Static Status = 0xC7 (Bits 0+1+2) -> Result: E6
+[30] Byte[0x04] Static Status = 0xD0 (E7 Solid)   -> Result: E7 D/S
+[31] Byte[0x04] Static Status = 0xD1 (E7<->E9)    -> Result: E7&E9 D/S
+[32] Byte[0x04] Static Status = 0xD2 (Bits 4+1)   -> Result: E7 D/S
+[33] Byte[0x04] Static Status = 0xD4 (Bits 4+2)   -> Result: E6
+[34] Byte[0x04] Static Status = 0xE0 (Brake Sub)  -> Result: Normal D/S
+
+--------------------------------------------------------------------------------
+BATCH 4: Byte[0x06] Sub-Controller Link Diagnostics (0 RPM, speedRaw = 3500)
+--------------------------------------------------------------------------------
+[35] Byte[0x06] Static Link = 0x10 (E17 Solid)    -> Result: E17 D/S
+[36] Byte[0x06] Static Link = 0x01 (Bit 0)        -> Result: Normal D/S
+[37] Byte[0x06] Static Link = 0x02 (Bit 1)        -> Result: Normal D/S
+[38] Byte[0x06] Static Link = 0x04 (Bit 2)        -> Result: E6
+[39] Byte[0x06] Static Link = 0x11 (Bits 4+0)     -> Result: E17 D/S
+[40] Byte[0x06] Static Link = 0x12 (Bits 4+1)     -> Result: E17 D/S
+[41] Byte[0x06] Static Link = 0x20 (Bit 5)        -> Result: E6
+
+--------------------------------------------------------------------------------
+BATCH 5: In-Motion Dynamic Diagnostic Tests (11 mph Cruising, speedRaw = 154)
+--------------------------------------------------------------------------------
+[42] Cruising 11mph + Byte[0x03]=0x01 (Rear Hall 1?) -> Result: E6
+[43] Cruising 11mph + Byte[0x03]=0x02 (Rear Hall 2?) -> Result: E6
+[44] Cruising 11mph + Byte[0x03]=0x04 (Rear Hall 3?) -> Result: E6
+[45] Cruising 11mph + Byte[0x03]=0x07 (Rear Hall 111?)-> Result: E6
+[46] Cruising 11mph + Byte[0x05]=0x01 (Front Hall 1?) -> Result: E6
+[47] Cruising 11mph + Byte[0x05]=0x02 (Front Hall 2?) -> Result: E6
+[48] Cruising 11mph + Byte[0x05]=0x04 (Front Hall 3?) -> Result: E6
+[49] Cruising 11mph + Byte[0x05]=0x07 (Front Hall 111?)-> Result: E6
+[50] Cruising 11mph + Byte[0x03]=0x11 (Dynamic E3)    -> Result: E6
+[51] Cruising 11mph + Byte[0x04]=0xC1 (Dynamic E9)    -> Result: E6
+[52] Cruising 11mph + Byte[0x04]=0xD0 (Dynamic E7)    -> Result: E6
+[53] Cruising 11mph + Byte[0x05]=0x10 (Dynamic E13)   -> Result: E6
+[54] Cruising 11mph + Byte[0x06]=0x10 (Dynamic E17)   -> Result: E6
+Never verified if speed was displaying correctly with no errors!
+
+--------------------------------------------------------------------------------
+BATCH 6: Regenerative Braking & PB Speed Gate Tests
+--------------------------------------------------------------------------------
+[55] Static Brake Single (0xE0, Sub 0x20)            -> Result: Normal D/S
+[56] Static Brake Dual (0xE8, Sub 0x20, DUAL)        -> Result: Normal D/S
+[57] Dynamic Brake 11mph Single (0xE0, Sub 0x20)     -> Result: E6
+[58] Dynamic Brake 11mph Dual (0xE8, Sub 0x20, DUAL) -> Result: E6
+[59] Dynamic Brake 60mph Single (0xE0, speedRaw=28)  -> Result: E6
+[60] Dynamic Brake 60mph Dual (0xE8, speedRaw=28)    -> Result: E6
+It looks like something is wrong with speed checksum! These tests were bugged out!
+================================================================================
