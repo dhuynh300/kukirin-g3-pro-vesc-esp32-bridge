@@ -23,6 +23,8 @@
 
 namespace fake {
     inline uint32_t& now_us() { static uint32_t t = 0; return t; }
+    // Microseconds added on every micros() call, so code that busy-waits on micros() can finish
+    inline uint32_t& auto_advance_us() { static uint32_t step = 0; return step; }
     inline void set_ms(uint32_t ms) { now_us() = ms * 1000u; }
     inline void advance_ms(uint32_t ms) { now_us() += ms * 1000u; }
 
@@ -34,7 +36,7 @@ namespace fake {
 }
 
 inline uint32_t millis() { return fake::now_us() / 1000u; }
-inline uint32_t micros() { return fake::now_us(); }
+inline uint32_t micros() { fake::now_us() += fake::auto_advance_us(); return fake::now_us(); }
 inline void pinMode(int pin, int mode) { if (pin >= 0 && pin < 64) fake::pin_modes()[pin] = mode; }
 inline void digitalWrite(int pin, int level) { if (pin >= 0 && pin < 64) fake::pin_levels()[pin] = level ? HIGH : LOW; }
 inline int digitalRead(int pin) { return (pin >= 0 && pin < 64) ? fake::pin_levels()[pin] : LOW; }
