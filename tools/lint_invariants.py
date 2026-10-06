@@ -15,6 +15,8 @@ Rules:
 
 Comments are ignored for the code rules. A line can opt out of one rule with a
 comment containing `lint-allow: <rule>`; use it only with a reason next to it.
+Raw test notes in docs/protocol/captures/ and docs/test-reports/data/ are kept as
+written, so only the credential and personal-path rules apply to them.
 
 Usage: python tools/lint_invariants.py [--root PATH] [file ...]
   (default: all tracked files outside third_party/ in the repository, or every file under --root)
@@ -26,6 +28,8 @@ import subprocess
 import sys
 
 CONTROL_CODE_DIRS = ("src/", "lib/KukirinDisplay/", "lib/VESCBridge/")
+# Raw test notes kept exactly as written: only the credential and personal-path rules apply
+EVIDENCE_DIRS = ("docs/protocol/captures/", "docs/test-reports/data/")
 CPP_EXT = (".cpp", ".h", ".hpp", ".c")
 TEXT_EXT = CPP_EXT + (".lbm", ".py", ".md", ".ini", ".json", ".txt", ".yml", ".yaml", ".csv")
 
@@ -144,7 +148,11 @@ def check_file(root, rel):
     raw = text.split("\n")
     found = []
 
+    evidence = rel.startswith(EVIDENCE_DIRS)
+
     def report(line_no, rule, message):
+        if evidence and rule not in ("credential", "personal-path"):
+            return
         if not allowed(raw, line_no, rule):
             found.append((rel, line_no, rule, message))
 
