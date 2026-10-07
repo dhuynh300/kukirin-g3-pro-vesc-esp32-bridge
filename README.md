@@ -83,6 +83,8 @@ Kukirin G3 Pro with its stock hub motors and battery, two Spintend Ubox Single 1
 
 I designed the architecture and the hardware, worked out the display protocol on the bench, and did all bench and road testing. I used coding agents for parts of the implementation and documentation, under the rules in [AGENTS.md](AGENTS.md), and checked changes with the unit tests, the project checks and the scooter itself.
 
+The public history starts on 2026-10-06, when the project moved here from an earlier private repository; the development timeline before that is in the [changelog](CHANGELOG.md#development-before-public-release).
+
 ## Limitations And Safety
 
 This firmware controls a 52 V vehicle with two high-current motor controllers. It is written for this one scooter and is still in development; open issues and planned fixes are listed in [docs/known-issues.md](docs/known-issues.md), and failure modes found during development in [docs/pitfalls.md](docs/pitfalls.md). Wiring or configuration mistakes can cause injury. It is provided without warranty; see the license.
