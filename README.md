@@ -1,5 +1,9 @@
 # Kukirin G3 Pro VESC ESP32 Bridge
 
+[![CI](https://github.com/dhuynh300/kukirin-g3-pro-vesc-esp32-bridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dhuynh300/kukirin-g3-pro-vesc-esp32-bridge/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/dhuynh300/kukirin-g3-pro-vesc-esp32-bridge)](https://github.com/dhuynh300/kukirin-g3-pro-vesc-esp32-bridge/releases/latest)
+
 ESP32 firmware that lets the Kukirin G3 Pro scooter's original display (TFM13-FEIMI-1) drive two VESC motor controllers, plus the LispBM script that runs the powertrain on the rear VESC.
 
 ## What It Does
