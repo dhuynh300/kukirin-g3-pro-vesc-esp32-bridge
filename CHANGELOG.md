@@ -1,6 +1,6 @@
 # Changelog
 
-## Version 1.0.0 (not yet tagged)
+## Version 1.0.0 (2026-10-06)
 
 First public release. The firmware is the 2026-10-01 build, the first ridden in daily use; every loaded section of the ESP32 image matches that build ([tools/compare_firmware.py](tools/compare_firmware.py)).
 
